@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "oncology-sbi-pkpd"
+version = "0.1.0"
+description = "Amortized simulation-based inference for oncology PKPD tumor-growth models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Edoardo Spigarolo", email = "edoardo.spigarolo@gmail.com"},
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "pyyaml>=6.0",
+    "torch>=2.0",
+    "sbi>=0.22",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "arviz>=0.15",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

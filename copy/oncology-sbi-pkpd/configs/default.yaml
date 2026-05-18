@@ -1,0 +1,37 @@
+# Default configuration for oncology-sbi-pkpd
+# Every number here corresponds to a sentence in the LaTeX document.
+
+simulator:
+  duration_days: 365.0
+  scan_interval_days: 56        # "Tumor evaluation every 8 weeks"
+  dose_interval_days: 14        # "FOLFOX4 repeated every two weeks"
+  dose_amount: 1.0              # normalized
+  kel_per_day: 0.35             # elimination rate constant
+  sigma_obs: 0.10               # log-normal observation noise CV ~ 10%
+
+synthetic:
+  n_patients_cohort: 100        # for visualization / smoke testing
+  n_sbi_training: 50000         # "Generate 50,000 virtual patient simulations"
+  seed_cohort: 123
+  seed_sbi: 42
+
+npe:
+  model: "nsf"                  # Neural Spline Flow
+  hidden_features: 64
+  num_transforms: 5
+  training_batch_size: 256
+  learning_rate: 0.0005
+  max_epochs: 200
+  stop_after_epochs: 20
+  device: "cpu"                 # or "cuda" if available
+
+sbc:
+  n_sbc_trials: 500             # number of SBC test cases
+  n_posterior_samples: 1000     # posterior samples per SBC trial
+  alpha: 0.01                   # KS test significance level
+  seed: 99
+
+validation:
+  n_test_patients: 200
+  credible_levels: [0.50, 0.80, 0.90, 0.95]
+  n_predictive_trajectories: 200

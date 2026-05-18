@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(pip install *)",
+      "PowerShell(cd \"d:\\\\Projects\\\\ml_redo\\\\copy\\\\oncology-sbi-pkpd\"; $env:PYTHONPATH = \"src\"; python -m pytest tests/test_clinical_loaders.py -v 2>&1)",
+      "PowerShell(cd \"d:\\\\Projects\\\\ml_redo\\\\copy\\\\oncology-sbi-pkpd\"; $env:PYTHONPATH = \"src\"; python -m pkpd_sbi.experiments.inspect_clinical_datasets --data-dir \"d:/Projects/ml_redo/oncology-sbi-pkpd/data\" 2>&1)",
+      "PowerShell(cd \"d:\\\\Projects\\\\ml_redo\\\\copy\\\\oncology-sbi-pkpd\"; $env:PYTHONPATH = \"src\"; python -m pytest tests/test_summaries.py tests/test_clinical_loaders.py tests/test_simulator.py -v 2>&1)",
+      "PowerShell(cd \"d:\\\\Projects\\\\ml_redo\\\\copy\\\\oncology-sbi-pkpd\"; $env:PYTHONPATH = \"src\"; python -m pytest tests/test_npe_real_conditioned.py tests/test_summaries.py tests/test_clinical_loaders.py tests/test_simulator.py -v 2>&1)",
+      "PowerShell(cd \"d:\\\\Projects\\\\ml_redo\\\\copy\\\\oncology-sbi-pkpd\"; $env:PYTHONPATH = \"src\"; python -m pytest tests/test_npe_real_conditioned.py tests/test_summaries.py -v 2>&1)",
+      "PowerShell(cd \"d:\\\\Projects\\\\ml_redo\\\\copy\\\\oncology-sbi-pkpd\"; $env:PYTHONPATH = \"src\"; python -m pytest tests/ -v --tb=short 2>&1 | tail -20)",
+      "PowerShell(cd \"d:\\\\Projects\\\\ml_redo\\\\copy\\\\oncology-sbi-pkpd\"; $env:PYTHONPATH = \"src\"; python -m pytest tests/ -v --tb=short 2>&1 | Select-Object -Last 20)"
+    ]
+  }
+}

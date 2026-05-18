@@ -1,0 +1,18 @@
+name: oncology-sbi
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - pyyaml
+  - pytest
+  - pip
+  - pip:
+      - sbi>=0.22
+      - torch>=2.0
+      - arviz

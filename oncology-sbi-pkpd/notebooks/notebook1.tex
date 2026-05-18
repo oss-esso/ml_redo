@@ -1,0 +1,1122 @@
+\documentclass[11pt,a4paper]{article}
+
+% -----------------------------------------------------------------------------
+% Packages
+% -----------------------------------------------------------------------------
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{microtype}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black
+}
+
+\lstdefinestyle{pythonstyle}{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue!70!black},
+    commentstyle=\color{green!40!black},
+    stringstyle=\color{red!50!black},
+    showstringspaces=false,
+    breaklines=true,
+    frame=single,
+    rulecolor=\color{black!20},
+    columns=fullflexible
+}
+
+\lstset{style=pythonstyle}
+
+% -----------------------------------------------------------------------------
+% Macros
+% -----------------------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\Normal}{\mathcal{N}}
+\newcommand{\Unif}{\mathcal{U}}
+\newcommand{\given}{\,\middle|\,}
+\newcommand{\thetaS}{\boldsymbol{\theta}}
+\newcommand{\xobs}{\mathbf{x}_{\mathrm{obs}}}
+\newcommand{\yobs}{\mathbf{y}_{\mathrm{obs}}}
+\newcommand{\half}{\frac{1}{2}}
+
+\title{A Curriculum for Simulation-Based Inference in Oncology PK/PD: Clinical Data Auditing, Tumor-Growth Modeling, Robust Fitting, Observation Shifts, and Nested Resistance}
+\author{Technical Report}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the theory, mathematics, and implementation logic of a stepwise oncology simulation-based inference (SBI) curriculum. The project begins with longitudinal clinical tumor-size data: patients receive anticancer treatment, tumor burden is monitored over time through scan-derived measurements, and the goal is to infer hidden patient-specific tumor-growth and drug-response parameters. We first construct a canonical data-loading and auditing layer over multiple clinical trial data schemas. We then formulate a Simeoni-style tumor growth inhibition ordinary differential equation (ODE) model, fit it to selected patient trajectories using robust optimization, and quantify failure modes through residual diagnostics. We extend the observation process with a changepoint-like multiplicative measurement shift and then extend the latent tumor model with a nested resistant component that preserves the original Simeoni damage/transit chain. Finally, we interpret the model-comparison results and explain how these steps prepare the ground for future SBI using conditional normalizing flows or related neural posterior estimators. The central methodological point is that SBI should not be applied blindly to a structurally inadequate simulator: clinical data preprocessing, model checking, identifiability analysis, robust observation modeling, and baseline optimization are necessary first.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% -----------------------------------------------------------------------------
+\section{High-Level Problem Statement}
+% -----------------------------------------------------------------------------
+
+The clinical setting can be described at the highest level as follows. We have a cohort of cancer patients indexed by
+\[
+    i = 1,\ldots,N.
+\]
+Each patient receives one or more anticancer drugs over time. Let the administered dose history for patient $i$ be denoted by
+\[
+    u_i = \{(t_{ik}^{\mathrm{dose}}, d_{ik}, a_{ik})\}_{k=1}^{K_i},
+\]
+where $t_{ik}^{\mathrm{dose}}$ is a dose time, $d_{ik}$ is a dose amount, and $a_{ik}$ may encode drug identity, treatment arm, or regimen information.
+
+The patient's tumor burden is measured at scan times
+\[
+    t_{ij}^{\mathrm{scan}}, \qquad j = 1,\ldots,T_i.
+\]
+In the current pipeline, the primary observable is a scan-derived tumor burden measurement, represented by the sum of longest diameters (SLD) or an SLD-like scalar. We write the observed SLD value as
+\[
+    y_{ij} > 0.
+\]
+The corresponding relative tumor burden is
+\[
+    r_{ij}
+    = \frac{y_{ij}}{y_{i1}},
+\]
+where $y_{i1}$ is the first selected tumor measurement for patient $i$. Equivalently, on log scale,
+\[
+    \ell_{ij}
+    = \log r_{ij}
+    = \log y_{ij} - \log y_{i1}.
+\]
+The log-relative representation is particularly useful because clinical measurement error and tumor response are often naturally multiplicative rather than additive.
+
+The hidden object of interest is a patient-specific parameter vector
+\[
+    \theta_i \in \Theta \subset \R^p,
+\]
+containing quantities such as tumor growth rate, drug-kill strength, damage transit rate, resistant fraction, and related parameters. These quantities are not measured directly. The core inverse problem is therefore
+\[
+    \text{dose history } u_i \text{ and observed trajectory } \{(t_{ij}, r_{ij})\}_{j=1}^{T_i}
+    \quad \Longrightarrow \quad
+    \text{plausible } \theta_i.
+\]
+
+In probabilistic terms, the eventual SBI target is the posterior distribution
+\[
+    p(\theta_i \given x_i),
+\]
+where $x_i$ denotes the encoded observation history of patient $i$. Importantly, this posterior may be wide, multimodal, or strongly correlated because sparse tumor-volume time series often do not identify all mechanistic parameters uniquely.
+
+\subsection{Why Not Jump Directly to SBI?}
+
+Simulation-based inference learns an approximate posterior from simulator-generated pairs
+\[
+    \theta^{(m)} \sim p(\theta),
+    \qquad
+    x^{(m)} \sim p(x \given \theta^{(m)}).
+\]
+A neural density estimator $q_\phi(\theta \given x)$ is then trained to approximate the true posterior. This is powerful, but it is only as scientifically useful as the simulator and observation process used to generate the training pairs.
+
+If the simulator systematically misses important clinical behavior, then the neural posterior will be calibrated relative to the wrong model. The workflow in this report therefore follows the sequence:
+\[
+\boxed{
+\text{data audit}
+\rightarrow
+\text{baseline simulator}
+\rightarrow
+\text{robust optimization}
+\rightarrow
+\text{model diagnostics}
+\rightarrow
+\text{observation/model extensions}
+\rightarrow
+\text{SBI}
+}
+\]
+not
+\[
+    \text{raw clinical data} \rightarrow \text{SBI immediately}.
+\]
+
+% -----------------------------------------------------------------------------
+\section{Canonical Clinical Data Layer}
+% -----------------------------------------------------------------------------
+
+\subsection{Purpose of the Loader}
+
+The raw data tree contains multiple clinical trial datasets with different schemas. Some datasets use Pfizer-style file names, some Sanofi-style file names, some Amgen legacy tables, some Amgen ADaM/PDS tables, and one AstraZeneca Cediranib dataset. To support common downstream analysis, the loader maps each dataset into a common object:
+\[
+    \mathcal{D}_s
+    = (O_s, D_s, C_s),
+\]
+where
+\begin{itemize}[leftmargin=2em]
+    \item $O_s$ is the canonical tumor observation table;
+    \item $D_s$ is the canonical dose table;
+    \item $C_s$ is the canonical covariate table.
+\end{itemize}
+
+Each loaded dataset is represented by a structure analogous to
+\begin{lstlisting}
+@dataclass(frozen=True)
+class ClinicalDataset:
+    study_id: str
+    observations: pd.DataFrame
+    doses: pd.DataFrame
+    covariates: pd.DataFrame
+\end{lstlisting}
+
+\subsection{Canonical Observation Table}
+
+The canonical observation table contains columns of the form
+\[
+\begin{array}{ll}
+\texttt{study\_id} & \text{study identifier},\\
+\texttt{patient\_id} & \text{patient identifier},\\
+\texttt{raw\_day} & \text{raw day variable from source data},\\
+\texttt{time\_days} & \text{day relative to treatment start when available},\\
+\texttt{sld\_mm} & \text{tumor burden / SLD-like measurement},\\
+\texttt{rel\_sld} & \text{relative tumor burden},\\
+\texttt{baseline\_sld\_mm} & \text{first SLD value used as baseline},\\
+\texttt{n\_lesions} & \text{number of lesions or collapsed rows},\\
+\texttt{arm} & \text{treatment arm when available}.
+\end{array}
+\]
+
+The canonical relative SLD is computed patient-wise as
+\[
+    \texttt{rel\_sld}_{ij}
+    = \frac{\texttt{sld\_mm}_{ij}}{\texttt{baseline\_sld\_mm}_{i}}.
+\]
+This maps all trajectories onto a dimensionless scale where baseline equals $1$.
+
+\subsection{Canonical Dose Table}
+
+The canonical dose table has columns
+\[
+\begin{array}{ll}
+\texttt{study\_id}, \texttt{patient\_id}, \texttt{raw\_day}, \texttt{time\_days},\\
+\texttt{drug}, \texttt{dose\_amount}, \texttt{dose\_unit}, \texttt{arm}.
+\end{array}
+\]
+In the fitting code, dose rows are converted into an idealized scalar exposure curve. The current implementation is not a full PK model; it treats dose events as normalized bolus inputs that decay exponentially.
+
+\subsection{Canonical Covariate Table}
+
+The covariate table contains demographic and treatment-arm information where available:
+\[
+    \texttt{study\_id}, \texttt{patient\_id}, \texttt{age}, \texttt{sex}, \texttt{race}, \texttt{arm}.
+\]
+These covariates are not yet used in fitting, but they will eventually support hierarchical and covariate-dependent priors of the form
+\[
+    \log \theta_i = \mu + B c_i + \eta_i,
+    \qquad
+    \eta_i \sim \Normal(0,\Sigma),
+\]
+where $c_i$ is a vector of patient covariates.
+
+\subsection{Dataset Discovery}
+
+The whole-tree discovery logic searches recursively for known file patterns. For example:
+\begin{itemize}[leftmargin=2em]
+    \item Pfizer A6181122: \texttt{tmm\_p.sas7bdat}, \texttt{testdrug.sas7bdat}, \texttt{demog.sas7bdat};
+    \item Sanofi EFC10262: \texttt{ls.sas7bdat}, \texttt{ex.sas7bdat}, \texttt{dm.sas7bdat};
+    \item Sanofi EFC5505/EFC4972: \texttt{measur.sas7bdat}, \texttt{dose.sas7bdat}, \texttt{demog.sas7bdat};
+    \item Amgen legacy: \texttt{lesion.sas7bdat}, \texttt{exposure.sas7bdat}, \texttt{demo.sas7bdat};
+    \item Amgen ADaM/PDS: \texttt{adls\_pds2019.sas7bdat}, \texttt{adsl\_pds2019.sas7bdat};
+    \item AstraZeneca Cediranib: \texttt{rdprcist.sas7bdat}, \texttt{rpdosad.sas7bdat}, \texttt{rpdem.sas7bdat}.
+\end{itemize}
+
+The generic lesson is that the loader is part of the statistical model. Different source schemas define tumor burden differently: lesion-level measurements, summed SLD columns, RECIST summaries, or ADaM response tables. Therefore, fitting performance must be interpreted in light of the measurement definition.
+
+% -----------------------------------------------------------------------------
+\section{Patient Selection and Trajectory Preprocessing}
+% -----------------------------------------------------------------------------
+
+\subsection{PK/PD Eligibility Filter}
+
+A first eligibility filter selects patients with at least $T_{\min}$ timepoints and a baseline observation near treatment start. In code this corresponds to conditions such as
+\[
+    T_i \geq 3,
+\]
+and
+\[
+    t_{i1} \in [t_{\min}^{\mathrm{base}}, t_{\max}^{\mathrm{base}}]
+    = [-60,14] \text{ days},
+\]
+where $t_{i1}$ is the first tumor measurement time relative to treatment start.
+
+This filter is not a final clinical inclusion criterion. It is a pragmatic constraint ensuring that the inverse problem is minimally meaningful.
+
+\subsection{Duplicate Scan Days}
+
+Real clinical datasets may contain duplicate rows for the same patient and day. Since ODE solvers such as \texttt{solve\_ivp} require strictly increasing evaluation times, duplicate scan days are collapsed. For a patient with multiple values on the same day, the current implementation uses the median:
+\[
+    \tilde{y}_{i}(t)
+    = \operatorname{median}\{y_{ij}: t_{ij}=t\}.
+\]
+This choice is robust and prevents duplicate entries from producing numerical failures.
+
+\subsection{Time Origin}
+
+For fitting a selected patient, the scan times are shifted so that the first selected tumor scan occurs at time zero:
+\[
+    \tau_{ij} = t_{ij} - t_{i1}.
+\]
+The observed relative SLD is also renormalized so that the first selected value is exactly $1$:
+\[
+    r_{ij}^{\mathrm{fit}} = \frac{r_{ij}}{r_{i1}}.
+\]
+This simplification makes the fitting problem invariant to absolute baseline tumor size in the observations. The simulator still contains an initial tumor burden parameter $v_0$, but the fitted output is relative tumor volume.
+
+% -----------------------------------------------------------------------------
+\section{Dose Schedule and Exposure Model}
+% -----------------------------------------------------------------------------
+
+\subsection{Simple Exponential Exposure Model}
+
+The current dose model converts dose events into a scalar concentration-like exposure curve
+\[
+    C(t)
+    = \sum_{k: t_k \leq t} d_k \exp[-k_{\mathrm{el}}(t-t_k)],
+\]
+where
+\begin{itemize}[leftmargin=2em]
+    \item $t_k$ is the shifted dose time;
+    \item $d_k$ is the normalized dose amount;
+    \item $k_{\mathrm{el}}$ is a fixed elimination rate.
+\end{itemize}
+
+The corresponding code is conceptually
+\begin{lstlisting}
+def concentration(t):
+    dt = t - dose_times
+    active = dt >= 0
+    return sum(dose_amounts[active] * exp(-kel * dt[active]))
+\end{lstlisting}
+
+This is not a full pharmacokinetic model. It is a simple forcing function for tumor dynamics. A later PK upgrade could replace this with a one- or two-compartment PK model:
+\[
+\begin{aligned}
+    \frac{dA_c}{dt} &= -\frac{CL}{V_c} A_c + \text{input}(t),\\
+    C(t) &= \frac{A_c(t)}{V_c},
+\end{aligned}
+\]
+or a more elaborate absorption/distribution/elimination model.
+
+\subsection{Patient-Specific Dose Schedule}
+
+For a selected patient, dose times are shifted by the same time origin as the tumor trajectory:
+\[
+    \tau_k^{\mathrm{dose} }
+    = t_k^{\mathrm{dose}} - t_{i1}^{\mathrm{scan}}.
+\]
+Doses before the first selected scan are allowed to have negative shifted times. They still contribute to $C(t)$ for $t\geq 0$ through the exponential tail.
+
+Raw dose amounts are normalized by the median positive dose amount:
+\[
+    \tilde{d}_k
+    = \frac{d_k}{\operatorname{median}\{d_\ell: d_\ell > 0\}}.
+\]
+This makes the dose scale roughly dimensionless and compatible with broad priors on the drug-kill parameter.
+
+% -----------------------------------------------------------------------------
+\section{Baseline Simeoni-Style Tumor Growth Inhibition Model}
+% -----------------------------------------------------------------------------
+
+\subsection{State Variables}
+
+The baseline simulator is a four-compartment Simeoni-style ODE model. The state is
+\[
+    x(t) = (x_1(t), x_2(t), x_3(t), x_4(t)),
+\]
+where
+\begin{itemize}[leftmargin=2em]
+    \item $x_1$ is proliferating tumor burden;
+    \item $x_2,x_3,x_4$ are damaged/transit compartments.
+\end{itemize}
+The total latent tumor burden is
+\[
+    V(t) = x_1(t)+x_2(t)+x_3(t)+x_4(t).
+\]
+
+\subsection{Parameter Vector}
+
+The patient-specific parameter vector is
+\[
+    \theta
+    = (\lambda_0, \lambda_1, \psi_g, k_{\mathrm{kill}}, k_{\mathrm{tr}}, v_0).
+\]
+The parameters have the following interpretation:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Parameter & Meaning \\
+\midrule
+$\lambda_0$ & early exponential tumor growth rate \\
+$\lambda_1$ & late approximately linear growth scale \\
+$\psi_g$ & transition shape between exponential and linear growth \\
+$k_{\mathrm{kill}}$ & drug-induced killing/damage rate coefficient \\
+$k_{\mathrm{tr}}$ & transit rate through damaged compartments \\
+$v_0$ & initial tumor burden \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Saturating Growth Term}
+
+The growth function is
+\[
+    g(x_1;\lambda_0,\lambda_1,\psi_g)
+    = \frac{\lambda_0 x_1}
+    {\left[1+\left(\frac{\lambda_0}{\lambda_1}x_1\right)^{\psi_g}\right]^{1/\psi_g}}.
+\]
+For small $x_1$,
+\[
+    \left(\frac{\lambda_0}{\lambda_1}x_1\right)^{\psi_g} \ll 1,
+\]
+so
+\[
+    g(x_1) \approx \lambda_0 x_1.
+\]
+For large $x_1$,
+\[
+    \left[1+\left(\frac{\lambda_0}{\lambda_1}x_1\right)^{\psi_g}\right]^{1/\psi_g}
+    \approx \frac{\lambda_0}{\lambda_1}x_1,
+\]
+and therefore
+\[
+    g(x_1) \approx \lambda_1.
+\]
+Thus the model transitions from exponential growth to approximately linear growth.
+
+\subsection{ODE System}
+
+The ODE is
+\[
+\begin{aligned}
+    \frac{dx_1}{dt}
+    &= g(x_1;\lambda_0,\lambda_1,\psi_g)
+       - k_{\mathrm{kill}} C(t) x_1,\\
+    \frac{dx_2}{dt}
+    &= k_{\mathrm{kill}} C(t) x_1 - k_{\mathrm{tr}}x_2,\\
+    \frac{dx_3}{dt}
+    &= k_{\mathrm{tr}}(x_2-x_3),\\
+    \frac{dx_4}{dt}
+    &= k_{\mathrm{tr}}(x_3-x_4).
+\end{aligned}
+\]
+The initial condition is
+\[
+    x(0) = (v_0,0,0,0).
+\]
+The simulated relative trajectory is
+\[
+    \hat{r}(t_j;\theta)
+    = \frac{V(t_j;\theta)}{V(t_1;\theta)}.
+\]
+Since in fitting we shift the first selected observation to $t_1=0$, this is usually
+\[
+    \hat{r}(t_j;\theta)=\frac{V(t_j;\theta)}{V(0;\theta)}.
+\]
+
+% -----------------------------------------------------------------------------
+\section{Prior Bounds and Parameterization}
+% -----------------------------------------------------------------------------
+
+The initial fitting and future SBI use broad biologically motivated log-uniform bounds. For the baseline model,
+\[
+    \log \theta_k \sim \Unif(a_k,b_k),
+\]
+with bounds approximately
+\[
+\begin{aligned}
+    \lambda_0 &\in [0.003,0.08],\\
+    \lambda_1 &\in [1000,30000],\\
+    \psi_g &\in [0.5,2.0],\\
+    k_{\mathrm{kill}} &\in [5\times 10^{-4}, 5\times 10^{-2}],\\
+    k_{\mathrm{tr}} &\in [0.02,0.20],\\
+    v_0 &\in [15,300].
+\end{aligned}
+\]
+Optimization is performed in transformed variables
+\[
+    z = \log \theta.
+\]
+This guarantees positivity of the natural-scale parameters and improves numerical conditioning.
+
+% -----------------------------------------------------------------------------
+\section{Loss Functions and Robust Fitting}
+% -----------------------------------------------------------------------------
+
+\subsection{Log-Relative Residuals}
+
+The primary residual is defined on log-relative SLD:
+\[
+    e_j(\theta)
+    = \log r_j - \log \hat{r}(t_j;\theta).
+\]
+This treats multiplicative errors symmetrically. For example, predicting $0.5$ when the observation is $1.0$ has residual
+\[
+    \log(1.0)-\log(0.5)=\log 2,
+\]
+while predicting $2.0$ when the observation is $1.0$ has residual
+\[
+    \log(1.0)-\log(2.0)=-\log 2.
+\]
+
+\subsection{RMSE in Log Space}
+
+The log-RMSE is
+\[
+    \operatorname{RMSE}_{\log}(\theta)
+    = \sqrt{\frac{1}{T}\sum_{j=1}^{T} e_j(\theta)^2}.
+\]
+A value of $0.30$ corresponds roughly to a typical multiplicative error of
+\[
+    \exp(0.30)-1 \approx 35\%.
+\]
+
+\subsection{Huber Loss}
+
+To reduce the influence of isolated jumps or scan artifacts, we also use a Huber-style robust loss in log space. For residual $e$ and threshold $\delta$,
+\[
+    \rho_\delta(e)
+    =
+    \begin{cases}
+    \frac{1}{2}e^2, & |e|\leq \delta,\\
+    \delta(|e|-\frac{1}{2}\delta), & |e|>\delta.
+    \end{cases}
+\]
+The aggregate robust score is reported on an RMSE-like scale:
+\[
+    L_{\mathrm{Huber}}(\theta)
+    = \sqrt{2\cdot \frac{1}{T}\sum_{j=1}^{T}\rho_\delta(e_j(\theta))}.
+\]
+In the code, $\delta=0.25$ was used, meaning residuals larger than about
+\[
+    \exp(0.25)-1 \approx 28\%
+\]
+are downweighted relative to pure squared error.
+
+\subsection{Optimization Strategy}
+
+The fitting workflow progressed through three levels:
+\begin{enumerate}[leftmargin=2em]
+    \item random search over prior bounds;
+    \item differential evolution for a stronger global baseline;
+    \item random initialization plus robust local least-squares for batch fitting.
+\end{enumerate}
+
+For least-squares refinement, the objective vector is
+\[
+    \mathbf{e}(z) = (e_1(z),\ldots,e_T(z)),
+\]
+and \texttt{scipy.optimize.least\_squares} is used with robust \texttt{soft\_l1} loss. The transformed variables $z$ are bounded by the prior ranges.
+
+% -----------------------------------------------------------------------------
+\section{Residual Diagnostics}
+% -----------------------------------------------------------------------------
+
+\subsection{Worst-Point Diagnostic}
+
+For each fitted trajectory, the residual vector
+\[
+    e_j = \log r_j - \log \hat{r}_j
+\]
+is inspected. The largest absolute residual is
+\[
+    j^* = \arg\max_j |e_j|.
+\]
+We compute
+\[
+    \operatorname{RMSE}_{\mathrm{all}}
+    = \sqrt{\frac{1}{T}\sum_j e_j^2},
+\]
+and the leave-one-out value
+\[
+    \operatorname{RMSE}_{-j^*}
+    = \sqrt{\frac{1}{T-1}\sum_{j\neq j^*}e_j^2}.
+\]
+The fractional gain from removing the worst point is
+\[
+    G_{\mathrm{outlier}}
+    = \frac{\operatorname{RMSE}_{\mathrm{all}}-\operatorname{RMSE}_{-j^*}}
+    {\operatorname{RMSE}_{\mathrm{all}}}.
+\]
+A large value suggests an isolated outlier rather than a systematic model failure.
+
+\subsection{Persistent Shift Diagnostic}
+
+For possible measurement-regime shifts, we consider breakpoints $k$ such that there are enough points before and after the breakpoint. For a candidate breakpoint $k$, split residuals into
+\[
+    \{e_j:j<k\},
+    \qquad
+    \{e_j:j\geq k\}.
+\]
+A persistent log-shift is estimated as
+\[
+    \Delta_k
+    = \overline{e}_{\mathrm{after}} - \overline{e}_{\mathrm{before}}.
+\]
+Then the corrected residuals are
+\[
+    e_j^{(k,\mathrm{corr})}
+    =
+    \begin{cases}
+    e_j, & j<k,\\
+    e_j - \Delta_k, & j\geq k.
+    \end{cases}
+\]
+The best breakpoint is the one minimizing corrected RMSE. The multiplicative shift factor is
+\[
+    \alpha_k = \exp(\Delta_k).
+\]
+If $\alpha_k$ is far from $1$ and the corrected RMSE improves substantially, this suggests a persistent observation shift.
+
+% -----------------------------------------------------------------------------
+\section{Observation Shift Model}
+% -----------------------------------------------------------------------------
+
+\subsection{Post-Hoc Observation Shift}
+
+The post-hoc observation shift model does not refit tumor parameters. Given a fitted smooth latent trajectory $\hat{r}(t_j;\theta)$, it applies a multiplicative offset after a breakpoint:
+\[
+    \hat{r}^{\mathrm{shift}}_j
+    =
+    \hat{r}(t_j;\theta)\exp(b\mathbf{1}_{j\geq k}).
+\]
+In log space,
+\[
+    \log \hat{r}^{\mathrm{shift}}_j
+    = \log \hat{r}(t_j;\theta) + b\mathbf{1}_{j\geq k}.
+\]
+This accounts for measurement processes where the reported SLD trajectory follows the same latent trend but is shifted after a certain scan.
+
+\subsection{Joint Observation Shift}
+
+The stronger version fits the tumor parameters and observation shift jointly:
+\[
+    \min_{\theta,b,k}
+    \sum_{j=1}^{T}
+    \rho_\delta\left(
+    \log r_j
+    - \log \hat{r}(t_j;\theta)
+    - b\mathbf{1}_{j\geq k}
+    \right).
+\]
+Because $k$ is discrete, the code tries a small set of candidate breakpoints, chosen from the largest observed log-jumps, and for each $k$ optimizes the continuous variables $(\theta,b)$.
+
+The fitted shift factor is
+\[
+    \alpha = \exp(b).
+\]
+Conservative selection accepts the joint shift only if it improves RMSE by a meaningful fraction and if $\alpha$ is sufficiently different from $1$.
+
+% -----------------------------------------------------------------------------
+\section{Batch Cohort Diagnostics}
+% -----------------------------------------------------------------------------
+
+\subsection{Comparable Patient Selection}
+
+A batch of $20$ patients was selected from a single study and, where possible, with comparable treatment/dose availability. Patient-level features included
+\[
+    T_i,\quad \text{duration}_i,
+    \quad \min_j r_{ij},
+    \quad \max_j r_{ij},
+    \quad \text{number of dose rows},
+\]
+as well as primary drug/signature summaries.
+
+The purpose of selecting within a study/medication context is to avoid confounding model diagnostics with fundamentally different drugs or disease settings.
+
+\subsection{Observed Baseline Performance}
+
+The plain Simeoni model produced mixed results: some patients were well fit, many were average, and some were poor. The joint observation-shift model improved a subset of trajectories, reducing the median RMSE from roughly $0.29$ to about $0.24$ in the selected batch. However, the shift layer was selected conservatively for only a minority of patients. This suggests that observation discontinuities are real but not the sole limitation.
+
+% -----------------------------------------------------------------------------
+\section{Simple Sensitive/Resistant Model and Its Limitation}
+% -----------------------------------------------------------------------------
+
+A first sensitive/resistant model was tested with two compartments,
+\[
+    S(t),\quad R(t),
+\]
+and total burden
+\[
+    V(t)=S(t)+R(t).
+\]
+The dynamics had the schematic form
+\[
+\begin{aligned}
+    \frac{dS}{dt} &= \text{growth}_S - \text{kill}_S - \text{transition}_{S\to R},\\
+    \frac{dR}{dt} &= \text{growth}_R - \text{kill}_R + \text{transition}_{S\to R}.
+\end{aligned}
+\]
+This model helped one patient dramatically but degraded several others. The likely reason is that it removed the original Simeoni damage/transit chain. Therefore, it was not nested with respect to the original successful mechanism.
+
+The lesson was that a biological extension should preserve the baseline model and add resistance as an optional component, so that when resistance is not needed the model can collapse back toward the original Simeoni behavior.
+
+% -----------------------------------------------------------------------------
+\section{Nested Resistant-Simeoni Model}
+% -----------------------------------------------------------------------------
+
+\subsection{Motivation}
+
+The nested resistant-Simeoni model extends the original model by adding a resistant proliferating compartment while preserving the sensitive damage/transit chain. This captures trajectories such as
+\[
+    \text{initial response} \rightarrow \text{plateau} \rightarrow \text{regrowth},
+\]
+without discarding the delayed shrinkage mechanism already represented by the Simeoni transit compartments.
+
+\subsection{State Variables}
+
+The state is
+\[
+    x(t)=(s_1(t),s_2(t),s_3(t),s_4(t),r(t)),
+\]
+where
+\begin{itemize}[leftmargin=2em]
+    \item $s_1$ is sensitive proliferating tumor;
+    \item $s_2,s_3,s_4$ are sensitive damaged/transit compartments;
+    \item $r$ is resistant tumor burden.
+\end{itemize}
+The observed latent tumor burden is
+\[
+    V(t)=s_1(t)+s_2(t)+s_3(t)+s_4(t)+r(t).
+\]
+
+\subsection{Parameters}
+
+The natural-scale parameter set is
+\[
+\begin{aligned}
+    \theta_{\mathrm{NR}} = (&\lambda_{0,s},\lambda_1,\psi_g,
+    k_{\mathrm{kill},s},k_{\mathrm{tr}},v_0,
+    f_{r0},m_r,q_r,k_{sr}),
+\end{aligned}
+\]
+where
+\begin{itemize}[leftmargin=2em]
+    \item $\lambda_{0,s}$ is sensitive growth rate;
+    \item $\lambda_1$ and $\psi_g$ define the shared saturating growth scale;
+    \item $k_{\mathrm{kill},s}$ is sensitive drug-kill strength;
+    \item $k_{\mathrm{tr}}$ is sensitive damage transit rate;
+    \item $v_0$ is total initial tumor burden;
+    \item $f_{r0}\in(0,1)$ is initial resistant fraction;
+    \item $m_r$ is the resistant growth multiplier;
+    \item $q_r\in(0,1)$ is the resistant kill fraction;
+    \item $k_{sr}$ is the sensitive-to-resistant transition rate.
+\end{itemize}
+The derived resistant parameters are
+\[
+    \lambda_{0,r}=m_r\lambda_{0,s},
+\]
+and
+\[
+    k_{\mathrm{kill},r}=q_r k_{\mathrm{kill},s}.
+\]
+
+\subsection{Initial Condition}
+
+The total initial burden is split into sensitive and resistant components:
+\[
+    s_1(0)=(1-f_{r0})v_0,
+    \qquad
+    r(0)=f_{r0}v_0,
+\]
+with
+\[
+    s_2(0)=s_3(0)=s_4(0)=0.
+\]
+
+\subsection{ODE System}
+
+The sensitive and resistant growth functions are
+\[
+    g_s(s_1)=g(s_1;\lambda_{0,s},\lambda_1,\psi_g),
+\]
+and
+\[
+    g_r(r)=g(r;\lambda_{0,r},\lambda_1,\psi_g).
+\]
+The drug kill terms are
+\[
+    K_s(t)=k_{\mathrm{kill},s}C(t)s_1(t),
+    \qquad
+    K_r(t)=k_{\mathrm{kill},r}C(t)r(t).
+\]
+The transition from sensitive to resistant tumor is
+\[
+    T_{sr}(t)=k_{sr}s_1(t).
+\]
+The ODE is
+\[
+\begin{aligned}
+    \frac{ds_1}{dt}
+    &= g_s(s_1) - K_s(t) - T_{sr}(t),\\
+    \frac{ds_2}{dt}
+    &= K_s(t) - k_{\mathrm{tr}}s_2,\\
+    \frac{ds_3}{dt}
+    &= k_{\mathrm{tr}}(s_2-s_3),\\
+    \frac{ds_4}{dt}
+    &= k_{\mathrm{tr}}(s_3-s_4),\\
+    \frac{dr}{dt}
+    &= g_r(r) - K_r(t) + T_{sr}(t).
+\end{aligned}
+\]
+
+\subsection{Nestedness}
+
+The model approximately reduces to the original Simeoni model when
+\[
+    f_{r0}\approx 0,
+    \qquad
+    k_{sr}\approx 0.
+\]
+Then $r(t)\approx 0$, and the sensitive chain behaves like the baseline model. This nestedness is important: it reduces the risk that a more complex model performs worse simply because it removed useful baseline dynamics.
+
+\subsection{Parameter Transformations}
+
+Positive parameters are optimized on log scale. Fraction parameters are optimized on logit scale:
+\[
+    \operatorname{logit}(p)=\log\frac{p}{1-p}.
+\]
+For example,
+\[
+    z_{f} = \operatorname{logit}(f_{r0}),
+    \qquad
+    f_{r0}=\frac{1}{1+e^{-z_f}}.
+\]
+This ensures constraints such as $f_{r0}\in(0,1)$ and $q_r\in(0,1)$.
+
+\subsection{Weak Prior Regularization}
+
+The nested model has more parameters than the baseline model. To stabilize optimization, a weak regularization term was added in transformed parameter space:
+\[
+    r_{\mathrm{prior},k}
+    = \lambda_{\mathrm{prior}}
+    \frac{z_k-z_{\mathrm{mid},k}}{h_k},
+\]
+where
+\[
+    z_{\mathrm{mid},k}=\frac{z_{\min,k}+z_{\max,k}}{2},
+    \qquad
+    h_k=\frac{z_{\max,k}-z_{\min,k}}{2}.
+\]
+The residual vector passed to least-squares becomes
+\[
+    \mathbf{r}_{\mathrm{total}}(z)
+    =
+    \begin{bmatrix}
+    \mathbf{e}_{\mathrm{data}}(z)\\
+    \mathbf{r}_{\mathrm{prior}}(z)
+    \end{bmatrix}.
+\]
+This is not a full Bayesian prior; it is an optimization stabilizer.
+
+\subsection{Near-Bound Diagnostics}
+
+A near-bound count is used as a rough identifiability warning. For each transformed parameter $z_k$, we check whether it lies within a small fraction of the lower or upper bound:
+\[
+    z_k \leq z_{\min,k}+\epsilon(z_{\max,k}-z_{\min,k})
+\]
+or
+\[
+    z_k \geq z_{\max,k}-\epsilon(z_{\max,k}-z_{\min,k}).
+\]
+A large number of near-bound parameters suggests the model may be overfitting or that the bounds/prior are not appropriate.
+
+% -----------------------------------------------------------------------------
+\section{Model Selection Rules}
+% -----------------------------------------------------------------------------
+
+\subsection{Simple Model Selection}
+
+The first model-selection step compares plain Simeoni to Simeoni plus joint observation shift. Define
+\[
+    R_S = \operatorname{RMSE}_{\log}(\text{Simeoni}),
+\]
+and
+\[
+    R_{S+J} = \operatorname{RMSE}_{\log}(\text{Simeoni + joint shift}).
+\]
+The fractional improvement is
+\[
+    G_{J} = \frac{R_S-R_{S+J}}{R_S}.
+\]
+The joint shift is accepted only if
+\[
+    G_J \geq 0.15
+\]
+and the shift factor $\alpha$ is nontrivial, for example
+\[
+    \alpha \leq 0.85
+    \qquad \text{or} \qquad
+    \alpha \geq 1.18.
+\]
+Otherwise the selected model remains plain Simeoni.
+
+\subsection{Nested Model Selection}
+
+The nested model is compared against the best existing simple model. Let
+\[
+    R_B = \operatorname{RMSE}_{\log}(\text{best existing model}),
+\]
+\[
+    R_N = \operatorname{RMSE}_{\log}(\text{nested resistant-Simeoni}),
+\]
+and
+\[
+    R_{N+P} = \operatorname{RMSE}_{\log}(\text{nested resistant-Simeoni + post-hoc shift}).
+\]
+The nested model is accepted only if
+\[
+    \frac{R_B-R_N}{R_B}\geq 0.15
+\]
+and the near-bound count is not excessive. The nested-plus-shift model is accepted if it improves sufficiently over both the previous best and the nested model alone.
+
+These conservative rules prevent automatically choosing the most complex model for every patient.
+
+% -----------------------------------------------------------------------------
+\section{Summary of Empirical Findings}
+% -----------------------------------------------------------------------------
+
+\subsection{Baseline and Observation Shift}
+
+On the selected 20-patient batch, plain Simeoni gave a useful but limited baseline. Many trajectories were fit at an average level, but some hard cases had large structured residuals. Joint observation shift improved the median RMSE, but it was selected conservatively for only a subset of patients. Therefore, measurement discontinuities exist, but they are not the entire explanation.
+
+\subsection{Nested Resistance}
+
+On the hard cases, the nested resistant-Simeoni model substantially improved fits. In particular, the nested model plus post-hoc observation shift gave strong improvements for several cases that were poorly explained by the simple model family. This suggests that the data contain at least three distinct patterns:
+\begin{enumerate}[leftmargin=2em]
+    \item smooth response trajectories well captured by the baseline Simeoni model;
+    \item measurement-regime shifts captured by the observation-shift layer;
+    \item rebound/regrowth or more complex smooth shapes captured better by the nested resistance extension.
+\end{enumerate}
+
+The resulting candidate simulator family for eventual SBI is therefore not plain Simeoni alone, but rather
+\[
+\boxed{
+    \text{nested resistant-Simeoni latent dynamics}
+    + \text{robust observation process}
+    + \text{optional observation changepoint}
+}
+\]
+
+% -----------------------------------------------------------------------------
+\section{Connection to Simulation-Based Inference}
+% -----------------------------------------------------------------------------
+
+\subsection{Forward Simulator}
+
+The future SBI simulator will sample parameters
+\[
+    \theta \sim p(\theta),
+\]
+simulate latent tumor dynamics
+\[
+    V(t_{1:T};\theta,u),
+\]
+and then simulate observations through a robust observation model. For example,
+\[
+    \log y_j
+    = \log V(t_j;\theta,u) + \epsilon_j,
+    \qquad
+    \epsilon_j \sim \Normal(0,\sigma^2),
+\]
+possibly augmented by heavy-tailed noise or a changepoint:
+\[
+    \log y_j
+    = \log V(t_j;\theta,u) + b\mathbf{1}_{j\geq k}+\epsilon_j.
+\]
+
+\subsection{Neural Posterior Estimation}
+
+The eventual neural posterior estimator learns
+\[
+    q_\phi(\theta \given x)
+    \approx p(\theta \given x),
+\]
+from simulated pairs
+\[
+    \{(\theta^{(m)},x^{(m)})\}_{m=1}^{M}.
+\]
+A common objective for neural posterior estimation is
+\[
+    \max_\phi \sum_{m=1}^{M}\log q_\phi(\theta^{(m)}\given x^{(m)}),
+\]
+or equivalently minimizing the negative log likelihood
+\[
+    \mathcal{L}(\phi)
+    = -\sum_{m=1}^{M}\log q_\phi(\theta^{(m)}\given x^{(m)}).
+\]
+The density estimator may be a conditional normalizing flow, neural spline flow, masked autoregressive flow, or mixture density network.
+
+\subsection{Observation Encoding}
+
+For a patient trajectory with irregular scan times, the observation can be encoded as
+\[
+    x_i = \{(t_{ij},\log r_{ij})\}_{j=1}^{T_i}.
+\]
+A fixed-size neural input can be obtained by padding:
+\[
+    \mathbf{X}_i
+    = \left[(\tilde{t}_{ij},\log r_{ij},m_{ij})\right]_{j=1}^{T_{\max}},
+\]
+where $m_{ij}\in\{0,1\}$ is a mask. More advanced encoders include set encoders, attention models, recurrent networks, and neural controlled differential equations.
+
+\subsection{Identifiability}
+
+The notes motivating this project emphasize that tumor inverse problems are often ill-posed. Multiple parameter vectors can generate similar tumor-volume trajectories. This is why a posterior distribution is more appropriate than a point estimate. Even if two parameter sets $\theta$ and $\theta'$ satisfy
+\[
+    V(t_j;\theta) \approx V(t_j;\theta')
+    \qquad
+    \forall j,
+\]
+they may correspond to different biological explanations. SBI can represent this uncertainty if the simulator and training distribution are well specified.
+
+\subsection{Calibration and Validation}
+
+Before using the posterior on real patients, the synthetic simulator should pass:
+\begin{enumerate}[leftmargin=2em]
+    \item parameter recovery on synthetic data;
+    \item posterior predictive checks;
+    \item simulation-based calibration;
+    \item comparison against optimization baselines;
+    \item sensitivity and identifiability analysis.
+\end{enumerate}
+
+Simulation-based calibration checks whether true parameters drawn from the prior are statistically consistent with posterior samples. Posterior predictive checks simulate trajectories from posterior samples and compare them to observed trajectories.
+
+% -----------------------------------------------------------------------------
+\section{Recommended Next Milestones}
+% -----------------------------------------------------------------------------
+
+\subsection{Milestone 1: Finalize Model Comparison on the 20-Patient Batch}
+
+Run the nested resistant-Simeoni model on all 20 patients and apply the conservative selection rule. Save:
+\begin{itemize}[leftmargin=2em]
+    \item long-format model comparison table;
+    \item wide-format per-patient comparison table;
+    \item selected model counts;
+    \item parameter sanity diagnostics;
+    \item fit plots for all patients.
+\end{itemize}
+
+\subsection{Milestone 2: Robust Observation Model}
+
+Replace deterministic post-hoc shifts with a probabilistic observation model:
+\[
+    \epsilon_j \sim t_\nu(0,\sigma),
+\]
+or a mixture
+\[
+    \epsilon_j \sim (1-\pi)\Normal(0,\sigma^2)+\pi\Normal(0,\sigma_{\mathrm{out}}^2),
+\]
+possibly with a latent changepoint. This is important because some clinical trajectories contain isolated or persistent measurement discontinuities.
+
+\subsection{Milestone 3: Synthetic SBI}
+
+Train SBI first on synthetic data generated from the selected model family. Do not use real patients as the primary validation yet. The synthetic tasks should include:
+\begin{itemize}[leftmargin=2em]
+    \item fixed scan times;
+    \item irregular scan times;
+    \item no observation shift;
+    \item observation outliers;
+    \item persistent observation shifts;
+    \item resistant/regrowth cases.
+\end{itemize}
+
+\subsection{Milestone 4: Real-Data Posterior Predictive Checks}
+
+For real patients, the goal should initially be posterior predictive quality, not clinical decision support. For each patient:
+\begin{enumerate}[leftmargin=2em]
+    \item infer posterior samples $\theta^{(s)}\sim q_\phi(\theta\given x_i)$;
+    \item simulate posterior predictive trajectories;
+    \item compute credible intervals;
+    \item assess coverage of observed SLD points;
+    \item compare against optimization baselines.
+\end{enumerate}
+
+% -----------------------------------------------------------------------------
+\section{Limitations}
+% -----------------------------------------------------------------------------
+
+The present workflow remains a simplified modeling exercise. Important limitations include:
+\begin{itemize}[leftmargin=2em]
+    \item The exposure model is not full pharmacokinetics.
+    \item SLD is a compressed representation of tumor burden and ignores lesion-level heterogeneity.
+    \item Parameter identifiability from sparse volume trajectories remains weak.
+    \item The observation shift layer is phenomenological and should not be overinterpreted biologically.
+    \item Resistant dynamics are simplified and not yet validated against lesion-level or biomarker data.
+    \item The current optimization uses point estimates, not full posterior uncertainty.
+\end{itemize}
+
+These limitations are not failures; they define the roadmap toward a more realistic SBI-ready simulator.
+
+% -----------------------------------------------------------------------------
+\section{Conclusion}
+% -----------------------------------------------------------------------------
+
+The work documented here establishes a rigorous pre-SBI modeling pipeline for oncology tumor-growth inference. Starting from heterogeneous clinical trial files, we built a canonical data layer, selected patient trajectories, implemented a Simeoni-style tumor growth inhibition model, fit it with robust optimization, diagnosed residual patterns, added an observation-shift layer, and then developed a nested resistant-Simeoni extension.
+
+The key conclusion is that plain Simeoni dynamics are a useful baseline but not sufficient for the difficult cases. Observation discontinuities explain some failures, while a nested resistant component explains additional hard trajectories. Therefore, the most credible next simulator for SBI is not a single smooth tumor model, but a family combining
+\[
+    \text{latent mechanistic tumor dynamics}
+    + \text{resistance/regrowth structure}
+    + \text{robust observation process}.
+\]
+Only after this simulator family has been validated synthetically should neural posterior estimation be trained and interpreted on real clinical trajectories.
+
+% -----------------------------------------------------------------------------
+\begin{thebibliography}{11}
+
+\bibitem{ezhov2023}
+D. Ezhov et al., ``Learn-Morph-Infer: A new way of solving the inverse problem for brain tumor modeling,'' \emph{Medical Image Analysis}, vol. 83, p. 102672, 2023.
+
+\bibitem{yankeelov2013}
+T. E. Yankeelov et al., ``Clinically Relevant Modeling of Tumor Growth and Treatment Response,'' \emph{Science Translational Medicine}, vol. 5, no. 187, p. 187ps9, 2013.
+
+\bibitem{siket2021}
+I. Siket et al., ``Parameter identification of a tumor model using artificial neural networks,'' in \emph{2021 IEEE 19th World Symposium on Applied Machine Intelligence and Informatics}, 2021, pp. 195--200.
+
+\bibitem{colin2015}
+T. Colin et al., ``Patient-specific simulation of tumor growth, response to the treatment, and relapse of a lung metastasis: a clinical case,'' \emph{Journal of Computational Surgery}, vol. 2, no. 1, p. 1, 2015.
+
+\bibitem{oden2013}
+J. T. Oden et al., ``Selection and assessment of phenomenological models of tumor growth,'' \emph{Mathematical Models and Methods in Applied Sciences}, vol. 23, no. 7, pp. 1309--1338, 2013.
+
+\bibitem{ganapolskii2022}
+V. M. Ganapolskii et al., ``Supermodeling, a convergent data assimilation meta-procedure used in simulation of tumor progression,'' \emph{Computers \& Mathematics with Applications}, vol. 116, pp. 187--210, 2022.
+
+\bibitem{whitaker2019}
+G. A. Whitaker et al., ``Bayesian inference for stochastic differential equation mixed effects models of a tumour xenography study,'' \emph{Journal of the Royal Statistical Society: Series C}, vol. 68, no. 4, pp. 887--914, 2019.
+
+\bibitem{mendes2022}
+T. G. S. P. Mendes et al., ``Accelerating robust plausible virtual patient cohort generation by substituting ODE simulations with parameter space mapping,'' \emph{Journal of Pharmacokinetics and Pharmacodynamics}, vol. 49, pp. 543--569, 2022.
+
+\bibitem{ditzler2018}
+G. Ditzler et al., ``Nonlinear Brain Tumor Model Estimation with Long Short-Term Memory Neural Networks,'' in \emph{2018 International Joint Conference on Neural Networks}, 2018, pp. 1--8.
+
+\bibitem{gholami2016}
+A. Gholami et al., ``An inverse problem formulation for parameter estimation of a reaction--diffusion model of low grade gliomas,'' \emph{Journal of Mathematical Biology}, vol. 72, pp. 409--433, 2016.
+
+\bibitem{le2018}
+A. L\^e et al., ``Subject-specific brain tumor growth modelling via an efficient Bayesian inference framework,'' in \emph{Medical Imaging 2018: Image Processing}, vol. 10574, p. 105741O, 2018.
+
+\end{thebibliography}
+
+\end{document}

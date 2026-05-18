@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python -c \"import sbi; print\\(sbi.__version__\\)\" 2>&1)",
+      "PowerShell(cd \"d:\\\\Projects\\\\ml_redo\\\\copy\\\\oncology-sbi-pkpd\"; $env:PYTHONPATH = \"src\"; python -m pkpd_sbi.experiments.train_npe_real_conditioned --data-dir \"d:/Projects/ml_redo/oncology-sbi-pkpd/data\" --n-train 10000 --n-ppc-patients 30 2>&1)"
+    ]
+  }
+}
