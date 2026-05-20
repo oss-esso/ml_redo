@@ -1,0 +1,1596 @@
+\documentclass[11pt,a4paper]{article}
+
+% -----------------------------------------------------------------------------
+% Packages
+% -----------------------------------------------------------------------------
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{microtype}
+\usepackage{float}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black
+}
+
+\lstdefinestyle{pythonstyle}{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue!70!black},
+    commentstyle=\color{green!40!black},
+    stringstyle=\color{red!50!black},
+    showstringspaces=false,
+    breaklines=true,
+    frame=single,
+    rulecolor=\color{black!20},
+    columns=fullflexible
+}
+\lstset{style=pythonstyle}
+
+% -----------------------------------------------------------------------------
+% Macros
+% -----------------------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\Normal}{\mathcal{N}}
+\newcommand{\Unif}{\mathcal{U}}
+\newcommand{\given}{\,|\,}
+\newcommand{\thetaS}{\boldsymbol{\theta}}
+\newcommand{\xobs}{\mathbf{x}_{\mathrm{obs}}}
+\newcommand{\yobs}{\mathbf{y}_{\mathrm{obs}}}
+\newcommand{\sld}{\ensuremath{\mathrm{SLD}}}
+\newcommand{\rel}{\ensuremath{\mathrm{rel}}}
+\newcommand{\PIT}{\mathrm{PIT}}
+@
+\title{A Full Integrated Report for the Oncology PK/PD and Simulation-Based Inference Curriculum\\\large Notebook-by-Notebook Theory, Outputs, and Identifiability Lessons}
+\author{Technical Report}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report expands the original write-up for \texttt{00\_clinical\_audit\_and\_model\_discovery.ipynb} into a full technical document covering the complete notebook sequence through Notebook 06B. The project starts with heterogeneous longitudinal oncology trial files, builds a canonical tumor-size and dose layer, fits mechanistic tumor-growth inhibition models, studies their hold-out and rolling-origin forecasting behavior, calibrates predictive uncertainty, selects clinically coherent simulation-based inference (SBI) starter strata, constructs real-template synthetic simulators, and then tests neural posterior estimation (NPE) on anti-angiogenic synthetic data. The central result is not a success story about increasingly complex neural models. The central result is an identifiability diagnosis: sparse relative \sld{} trajectories can support useful empirical forecasting and modest posterior predictive uncertainty quantification, but they weakly identify detailed mechanistic PK/PD parameters even under simulator-matched synthetic data. Consequently, the correct next milestone is posterior predictive validation and uncertainty calibration, not raw parameter recovery on real patients.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% -----------------------------------------------------------------------------
+\section{High-Level Problem Statement}
+% -----------------------------------------------------------------------------
+
+We observe cancer patients indexed by
+\[
+    i=1,\ldots,N.
+\]
+Patient $i$ receives one or more anticancer drugs over time. Let the dose history be
+\[
+    u_i=\{(t_{ik}^{\mathrm{dose}},d_{ik},a_{ik})\}_{k=1}^{K_i},
+\]
+where $t_{ik}^{\mathrm{dose}}$ is the administration time, $d_{ik}$ is the amount, and $a_{ik}$ identifies the drug or regimen.
+
+Tumor burden is observed at scan times
+\[
+    t_{ij}^{\mathrm{scan}}, \qquad j=1,\ldots,T_i,
+\]
+through an \sld-like scalar $y_{ij}>0$. The relative tumor trajectory is
+\[
+    r_{ij}=\frac{y_{ij}}{y_{i1}},
+\]
+and on log scale
+\[
+    \ell_{ij}=\log r_{ij}=\log y_{ij}-\log y_{i1}.
+\]
+
+The scientific target is a patient-specific latent parameter vector
+\[
+    \theta_i\in\Theta\subset\R^p
+\]
+containing quantities such as growth rates, transit rates, treatment effect sizes, resistance fractions, or carrying-capacity parameters. The eventual Bayesian inverse problem is
+\[
+    p(\theta_i\given x_i),
+\]
+where $x_i$ encodes scan times, relative tumor sizes, dose history, and covariates.
+
+This report explains why the project did \emph{not} jump directly to SBI. The full workflow was
+\[
+\boxed{
+\text{clinical audit}
+\rightarrow
+\text{mechanistic fitting}
+\rightarrow
+\text{hold-out validation}
+\rightarrow
+\text{rolling-origin baselines}
+\rightarrow
+\text{probabilistic calibration}
+\rightarrow
+\text{stratum selection}
+\rightarrow
+\text{synthetic SBI}
+\rightarrow
+\text{identifiability diagnosis}
+}
+\]
+rather than
+\[
+    \text{raw longitudinal data}\rightarrow\text{neural posterior estimation immediately}.
+\]
+
+The logic is simple: if the simulator family is structurally inadequate, or if the data weakly identify its parameters, a learned posterior can look sophisticated while remaining scientifically misleading.
+
+% -----------------------------------------------------------------------------
+\section{Global Mathematical Framing}
+% -----------------------------------------------------------------------------
+
+\subsection{Observation and Loss Geometry}
+
+Throughout the notebook sequence, the main residual is defined in log-relative tumor space:
+\[
+    e_j(\theta)=\log r_j-\log \widehat r(t_j;\theta,u).
+\]
+This is appropriate because multiplicative tumor-size errors are more clinically realistic than additive millimeter errors. A symmetric doubling/halving discrepancy gives equal-magnitude residuals with opposite sign.
+
+The standard log-RMSE is
+\[
+    \operatorname{RMSE}_{\log}(\theta)
+    =
+    \sqrt{\frac{1}{T}\sum_{j=1}^{T}e_j(\theta)^2}.
+\]
+A value near $0.30$ corresponds to a typical multiplicative error of
+\[
+    \exp(0.30)-1\approx 35\%.
+\]
+
+\subsection{Forward-Simulator View}
+
+Every notebook after the audit phase is implicitly organized around a forward simulator
+\[
+    \theta\sim p(\theta),
+    \qquad
+    x\sim p(x\given\theta),
+\]
+even when the immediate task is deterministic fitting. The SBI question only becomes meaningful once we know:
+\begin{enumerate}[leftmargin=2em]
+    \item what the latent dynamics are,
+    \item what the observation model is,
+    \item what forecasting baselines the simulator must beat,
+    \item whether the parameters are even identifiable from the chosen observation channel.
+\end{enumerate}
+
+The rest of the report follows the notebook chronology while keeping this inverse-problem perspective explicit.
+
+% -----------------------------------------------------------------------------
+\section{Notebook 00: Clinical Audit and First Model Discovery}
+% -----------------------------------------------------------------------------
+
+Notebook 00 is the foundation of the whole project. It is the notebook originally documented in \texttt{notebook1.tex}, so this section preserves its depth and then connects it to the later notebooks.
+
+\subsection{Canonical Clinical Data Layer}
+
+The raw data tree contains multiple oncology trials with different schemas, file names, and measurement conventions. Each discovered study $s$ is mapped into a canonical object
+\[
+    \mathcal D_s=(O_s,D_s,C_s),
+\]
+where
+\begin{itemize}[leftmargin=2em]
+    \item $O_s$ is the canonical tumor observation table,
+    \item $D_s$ is the canonical dose table,
+    \item $C_s$ is the canonical covariate table.
+\end{itemize}
+
+The observation table contains columns such as
+\[
+\begin{array}{ll}
+\texttt{study\_id}, & \texttt{patient\_id},\\
+\texttt{raw\_day}, & \texttt{time\_days},\\
+\texttt{sld\_mm}, & \texttt{rel\_sld},\\
+\texttt{baseline\_sld\_mm}, & \texttt{n\_lesions},\\
+\texttt{arm}. &
+\end{array}
+\]
+The relative tumor burden is computed patient-wise as
+\[
+    \texttt{rel\_sld}_{ij}
+    =
+    \frac{\texttt{sld\_mm}_{ij}}
+    {\texttt{baseline\_sld\_mm}_{i}}.
+\]
+
+The dose table stores
+\[
+    \texttt{study\_id},
+    \texttt{patient\_id},
+    \texttt{time\_days},
+    \texttt{drug},
+    \texttt{dose\_amount},
+    \texttt{dose\_unit},
+    \texttt{arm},
+\]
+while the covariate table keeps demographic and arm metadata for later hierarchical priors or covariate-conditioned SBI.
+
+\subsection{Dataset Discovery and Eligibility}
+
+The loader recursively searches for known trial-specific patterns and maps them into the common schema. A patient is considered PK/PD-eligible when the trajectory has enough scans and a plausible baseline near treatment initiation. Typical filters are of the form
+\[
+    T_i\geq 3,
+    \qquad
+    t_{i1}\in[-60,14]\ \text{days}.
+\]
+
+Duplicate same-day observations are collapsed, typically via a within-day median,
+\[
+    \widetilde y_i(t)=\operatorname{median}\{y_{ij}:t_{ij}=t\},
+\]
+so that the ODE solver only sees strictly increasing evaluation times.
+
+\subsection{Audit Outputs}
+
+Notebook 00 loaded ten studies and produced the canonical audit summarized in Table~\ref{tab:audit-summary}. The table is important because it explains why later notebooks focus on certain strata and not others: scan counts, dose completeness, and tumor-size distributions differ meaningfully across studies.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Canonical clinical audit summary from Notebook 00.}
+\label{tab:audit-summary}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Study & Obs. pts. & Eligible pts. & Obs. rows & Dose rows & Median scans & Median baseline \sld{} & Median rel.\ \sld{} \\
+\midrule
+A6181122 & 378 & 321 & 2,307 & 23,046 & 6.0 & 115.5 & 0.807 \\
+DATASET\_263 & 945 & 671 & 4,139 & 45,516 & 4.0 & 120.0 & 0.949 \\
+DATASET\_264 & 935 & 804 & 5,369 & 92,188 & 5.0 & 134.0 & 0.673 \\
+EFC10262 & 592 & 446 & 2,953 & 30,117 & 4.0 & 110.3 & 0.969 \\
+EFC5505 & 432 & 358 & 2,001 & 24,901 & 5.0 & 110.0 & 0.685 \\
+EFC4972 & 320 & 273 & 1,503 & 23,639 & 5.0 & 90.2 & 0.737 \\
+AMGEN\_20050203 & 488 & 387 & 2,476 & 0 & 4.0 & 157.5 & 0.672 \\
+AMGEN\_20020408 & 275 & 69 & 672 & 0 & 2.0 & 196.0 & 1.000 \\
+CEDIRANIB\_HORIZONIII & 688 & 584 & 3,340 & 46,174 & 5.0 & 10.95 & 0.759 \\
+AMGEN\_20040249 & 809 & 655 & 3,802 & 67,273 & 4.0 & 127.0 & 0.794 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Exposure Approximation}
+
+The first mechanistic models do not yet use full pharmacokinetics. Instead, dose events are converted into a simple concentration-like forcing curve
+\[
+    C(t)=\sum_{k:t_k\leq t}d_k\exp[-k_{\mathrm{el}}(t-t_k)].
+\]
+Dose amounts are normalized by the median positive dose amount so that $k_{\mathrm{kill}}$ can be given broad but stable priors. This simplification is deliberate: the project first tests whether the tumor-size signal alone supports meaningful inverse inference before adding additional PK complexity.
+
+\subsection{Baseline Simeoni Tumor-Growth Inhibition Model}
+
+The baseline simulator is a four-state Simeoni-style model with proliferating tumor $x_1$ and three damaged/transit compartments $x_2,x_3,x_4$:
+\[
+    V(t)=x_1(t)+x_2(t)+x_3(t)+x_4(t).
+\]
+The patient-specific parameter vector is
+\[
+    \theta=(\lambda_0,\lambda_1,\psi_g,k_{\mathrm{kill}},k_{\mathrm{tr}},v_0).
+\]
+
+The saturating growth function is
+\[
+    g(x_1;\lambda_0,\lambda_1,\psi_g)
+    =
+    \frac{\lambda_0 x_1}
+    {\left[1+\left(\frac{\lambda_0}{\lambda_1}x_1\right)^{\psi_g}\right]^{1/\psi_g}}.
+\]
+For small $x_1$, the dynamics are approximately exponential, $g(x_1)\approx\lambda_0x_1$. For large $x_1$, the growth rate approaches an approximately linear regime, $g(x_1)\approx\lambda_1$.
+
+The ODE system is
+\[
+\begin{aligned}
+    \frac{dx_1}{dt}
+    &=g(x_1)-k_{\mathrm{kill}}C(t)x_1,\\
+    \frac{dx_2}{dt}
+    &=k_{\mathrm{kill}}C(t)x_1-k_{\mathrm{tr}}x_2,\\
+    \frac{dx_3}{dt}
+    &=k_{\mathrm{tr}}(x_2-x_3),\\
+    \frac{dx_4}{dt}
+    &=k_{\mathrm{tr}}(x_3-x_4),
+\end{aligned}
+\]
+with
+\[
+    x(0)=(v_0,0,0,0).
+\]
+The fitted observable is the relative trajectory
+\[
+    \widehat r(t_j;\theta)=\frac{V(t_j;\theta)}{V(t_1;\theta)}.
+\]
+
+\subsection{Optimization and Robust Residuals}
+
+The project optimizes on transformed parameters $z=\log\theta$ to enforce positivity and improve numerical conditioning. Both squared-error and Huber-style robust losses are used in log-relative space. For threshold $\delta$,
+\[
+    \rho_\delta(e)=
+    \begin{cases}
+        \frac{1}{2}e^2, & |e|\leq\delta,\\
+        \delta\left(|e|-\frac{1}{2}\delta\right), & |e|>\delta.
+    \end{cases}
+\]
+The corresponding robust aggregate score is
+\[
+    L_{\mathrm{Huber}}(\theta)
+    =
+    \sqrt{2\cdot\frac{1}{T}\sum_{j=1}^{T}\rho_\delta(e_j(\theta))}.
+\]
+
+This matters because sparse clinical trajectories often contain outlying jumps or measurement inconsistencies. A model that only succeeds under pure least-squares may be too fragile for later SBI.
+
+\subsection{Observation-Shift Extension}
+
+Early residual plots revealed cases where the mechanistic shape looked plausible but the later observations appeared shifted upward or downward. A multiplicative observation changepoint was introduced:
+\[
+    \log \widehat r^{\mathrm{shift}}_j
+    =
+    \log \widehat r(t_j;\theta)+b\,\mathbf{1}_{j\geq k},
+\]
+where $k$ is a breakpoint index and $\exp(b)$ is the multiplicative shift factor. This is not a biological effect model. It is a measurement-process diagnostic layer.
+
+\subsection{Nested Resistant-Simeoni Model}
+
+The first two-compartment sensitive/resistant extension was not properly nested in the original Simeoni model and often degraded fits. The key modeling correction was the \emph{nested resistant-Simeoni} extension, which preserves the original sensitive damage chain and adds a resistant compartment:
+\[
+    x(t)=\bigl(s_1(t),s_2(t),s_3(t),s_4(t),r(t)\bigr),
+\]
+with total burden
+\[
+    V(t)=s_1+s_2+s_3+s_4+r.
+\]
+
+The parameters are
+\[
+    \theta_{\mathrm{NR}}
+    =
+    (\lambda_{0,s},\lambda_1,\psi_g,k_{\mathrm{kill},s},k_{\mathrm{tr}},v_0,f_{r0},m_r,q_r,k_{sr}).
+\]
+The resistant parameters are tied to the sensitive ones through
+\[
+    \lambda_{0,r}=m_r\lambda_{0,s},
+    \qquad
+    k_{\mathrm{kill},r}=q_r k_{\mathrm{kill},s}.
+\]
+
+The ODE becomes
+\[
+\begin{aligned}
+    \frac{ds_1}{dt}&=g_s(s_1)-k_{\mathrm{kill},s}C(t)s_1-k_{sr}s_1,\\
+    \frac{ds_2}{dt}&=k_{\mathrm{kill},s}C(t)s_1-k_{\mathrm{tr}}s_2,\\
+    \frac{ds_3}{dt}&=k_{\mathrm{tr}}(s_2-s_3),\\
+    \frac{ds_4}{dt}&=k_{\mathrm{tr}}(s_3-s_4),\\
+    \frac{dr}{dt}&=g_r(r)-k_{\mathrm{kill},r}C(t)r+k_{sr}s_1.
+\end{aligned}
+\]
+This model approximately reduces to the plain Simeoni model when
+\[
+    f_{r0}\approx 0,
+    \qquad
+    k_{sr}\approx 0.
+\]
+
+\subsection{Notebook 00 Outputs}
+
+On the first showcased patient, DATASET\_263 / 203705005, using the patient-specific dose schedule reduced differential-evolution log-RMSE from roughly $0.273$ under a generic q2w schedule to roughly $0.202$ under the actual dose schedule. This established a key principle for the rest of the project: even simple tumor models benefit materially from correct dosing context.
+
+For the selected retrospective 20-patient batch, the main results were:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Notebook 00 retrospective model comparison over the 20-patient batch.}
+\label{tab:n00-results}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Median RMSE & Mean RMSE & Min & Max \\
+\midrule
+FinalSelectedConservative & 0.151 & 0.181 & 0.036 & 0.530 \\
+NestedResistantSimeoni\_plus\_posthoc\_shift & 0.151 & 0.176 & 0.035 & 0.485 \\
+NestedResistantSimeoni & 0.178 & 0.200 & 0.036 & 0.500 \\
+Simeoni\_plus\_joint\_observation\_shift & 0.238 & 0.271 & 0.058 & 0.612 \\
+Simeoni & 0.290 & 0.290 & 0.084 & 0.612 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The final conservative model counts were:
+\begin{itemize}[leftmargin=2em]
+    \item NestedResistantSimeoni\_plus\_posthoc\_shift: 7 patients,
+    \item NestedResistantSimeoni: 6 patients,
+    \item Simeoni: 6 patients,
+    \item Simeoni\_plus\_joint\_observation\_shift: 1 patient.
+\end{itemize}
+
+The median RMSE improved from
+\[
+    0.2898 \quad \text{(plain Simeoni)}
+\]
+to
+\[
+    0.2405 \quad \text{(best simple existing model)}
+\]
+and then to
+\[
+    0.1508 \quad \text{(final conservative selected model)}.
+\]
+
+\paragraph{Interpretation.}
+Notebook 00 delivered a strong retrospective modeling result and a strong warning at the same time. Richer dynamics and observation layers clearly improved fit. But this was \emph{in-sample} evidence only. The next notebook had to ask whether these apparent improvements generalized to future scans or simply overfit sparse trajectories.
+
+% -----------------------------------------------------------------------------
+\section{Notebook 01: Hold-Out Model Validation}
+% -----------------------------------------------------------------------------
+
+Notebook 01 is where the project first stress-tested the optimism created by Notebook 00. The question changed from
+\[
+    \text{Can the model explain an entire observed trajectory?}
+\]
+to
+\[
+    \text{Can the model trained on early scans predict later scans?}
+\]
+
+\subsection{Train/Test Split Logic}
+
+For each of the same 20 patients, the trajectory was split chronologically. Roughly the first
+\[
+    75\%
+\]
+of scans formed the training segment and the last
+\[
+    25\%
+\]
+formed the hold-out segment. Models were fit only on the training prefix and evaluated on future scans.
+
+This is critical because a sparse longitudinal fit can look impressive if it is allowed to see the entire future trajectory during optimization.
+
+\subsection{Hold-Out Objective and Complexity Penalty}
+
+Training still used log-RMSE-like objectives, but evaluation focused on future prediction error. Notebook 01 also tracked BIC-like complexity-aware comparison. In generic form,
+\[
+    \mathrm{BIC}=n\log\!\left(\frac{\mathrm{RSS}}{n}\right)+k\log n,
+\]
+where $k$ is the number of fitted parameters. The notebook compared:
+\begin{itemize}[leftmargin=2em]
+    \item rule-based conservative selection,
+    \item BIC-based selection,
+    \item per-model train and test RMSE summaries.
+\end{itemize}
+
+\subsection{Notebook 01 Outputs}
+
+The key numerical summary is shown in Table~\ref{tab:n01-results}.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Notebook 01 hold-out validation summary. Training fit improved with flexibility, but future test error remained high.}
+\label{tab:n01-results}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Median train RMSE & Median test RMSE & Mean test RMSE & Median BIC \\
+\midrule
+NestedResistantSimeoni & 0.172 & 0.488 & 0.646 & -10.60 \\
+Simeoni\_plus\_joint\_observation\_shift & 0.197 & 0.495 & 0.591 & -11.18 \\
+NestedResistantSimeoni\_plus\_posthoc\_shift & 0.154 & 0.498 & 0.613 & -7.34 \\
+Simeoni & 0.216 & 0.513 & 0.602 & -13.55 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The conservative rule-based selection counts were:
+\begin{itemize}[leftmargin=2em]
+    \item Simeoni: 9,
+    \item NestedResistantSimeoni: 6,
+    \item NestedResistantSimeoni\_plus\_posthoc\_shift: 4,
+    \item Simeoni\_plus\_joint\_observation\_shift: 1.
+\end{itemize}
+
+The BIC selection counts were:
+\begin{itemize}[leftmargin=2em]
+    \item Simeoni: 14,
+    \item Simeoni\_plus\_joint\_observation\_shift: 3,
+    \item NestedResistantSimeoni: 2,
+    \item NestedResistantSimeoni\_plus\_posthoc\_shift: 1.
+\end{itemize}
+
+Most importantly, the median test RMSE of the rule-selected model was
+\[
+    0.4246,
+\]
+while the median test RMSE of the BIC-selected model was
+\[
+    0.5257.
+\]
+
+\subsection{What Notebook 01 Changed Scientifically}
+
+Notebook 01 showed that the retrospective success of Notebook 00 did not transfer cleanly to future scans. Mechanistic flexibility lowered training error substantially, but median test RMSEs still clustered near
+\[
+    0.49\text{--}0.51,
+\]
+which is much worse than the training fit quality.
+
+This is the first major identifiability warning:
+\[
+\boxed{
+\text{a mechanistic model can interpolate early scans well while still failing as a forecasting model}
+}
+\]
+because the data do not constrain the hidden parameters sharply enough.
+
+That finding motivated Notebook 02, where the project stopped treating ``future prediction'' as a single split problem and switched to repeated rolling-origin forecasting.
+
+% -----------------------------------------------------------------------------
+\section{Notebook 02: Forecasting Baselines and Rolling-Origin Validation}
+% -----------------------------------------------------------------------------
+
+Notebook 02 reframed the problem in a more practical way. Instead of one train/test split per patient, it asked:
+\[
+    \text{Given scans }1,\ldots,j,\ \text{how well can we predict scan }j+1?
+\]
+
+\subsection{Rolling-Origin Forecasting Setup}
+
+At each forecast origin $j$, the model sees a prefix
+\[
+    \{(t_1,r_1),\ldots,(t_j,r_j)\}
+\]
+and predicts the next relative tumor size. The target is therefore a one-step predictive distribution or point prediction for
+\[
+    r_{j+1}\given r_{1:j},u_{1:j}.
+\]
+
+The loss on each origin is based on the log error
+\[
+    \varepsilon_{j+1}
+    =
+    \log r_{j+1}-\log \widehat r_{j+1}.
+\]
+Notebook 02 reports
+\begin{itemize}[leftmargin=2em]
+    \item median absolute log error,
+    \item mean absolute log error,
+    \item one-step RMSE.
+\end{itemize}
+
+\subsection{Empirical Baselines}
+
+Three empirical baselines are especially important:
+
+\paragraph{LOCF.}
+Last observation carried forward predicts
+\[
+    \widehat r_{j+1}=r_j.
+\]
+This is a persistence baseline.
+
+\paragraph{RecentLogSlope.}
+Use the most recent local slope on log scale,
+\[
+    \widehat{\log r}_{j+1}
+    =
+    \log r_j
+    +
+    \frac{\log r_j-\log r_{j-1}}{t_j-t_{j-1}}
+    (t_{j+1}-t_j).
+\]
+
+\paragraph{LogLinear.}
+Fit a least-squares line to the available prefix in log space,
+\[
+    \log r(t)\approx \beta_0+\beta_1 t,
+\]
+and extrapolate to the next scan time.
+
+These baselines are scientifically useful because they set the minimum forecasting standard that a mechanistic simulator must beat before being trusted for SBI.
+
+\subsection{Mechanistic Competitors}
+
+Notebook 02 compares the empirical baselines against:
+\begin{itemize}[leftmargin=2em]
+    \item Simeoni,
+    \item Simeoni\_plus\_joint\_observation\_shift,
+    \item NestedResistantSimeoni,
+    \item NestedResistantSimeoni\_plus\_train\_shift.
+\end{itemize}
+
+The ``train shift'' variant only uses information available up to the forecast origin, preventing direct look-ahead leakage.
+
+\subsection{Notebook 02 Outputs}
+
+The main one-step forecasting results are in Table~\ref{tab:n02-results}.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Notebook 02 rolling-origin one-step forecasting on the 20-patient cohort.}
+\label{tab:n02-results}
+\begin{tabular}{lrrrr}
+\toprule
+Model & N origins & Median $|\log$ err$|$ & Mean $|\log$ err$|$ & RMSE \\
+\midrule
+LOCF & 134 & 0.046 & 0.102 & 0.185 \\
+RecentLogSlope & 134 & 0.066 & 0.127 & 0.210 \\
+LogLinear & 134 & 0.243 & 0.295 & 0.376 \\
+NestedResistantSimeoni\_plus\_train\_shift & 134 & 0.234 & 0.313 & 0.404 \\
+NestedResistantSimeoni & 134 & 0.239 & 0.342 & 0.462 \\
+Simeoni\_plus\_joint\_observation\_shift & 134 & 0.312 & 0.411 & 0.542 \\
+Simeoni & 134 & 0.320 & 0.442 & 0.582 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Selection strategies were also compared:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Notebook 02 rolling-origin selection strategy comparison.}
+\label{tab:n02-selection}
+\begin{tabular}{lrrr}
+\toprule
+Strategy & Count & Median $|\log$ err$|$ & RMSE \\
+\midrule
+oracle\_per\_origin & 134 & 0.026 & 0.105 \\
+global\_best\_LOCF & 134 & 0.046 & 0.185 \\
+adaptive\_past\_patient\_errors & 134 & 0.049 & 0.204 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The per-patient best-model counts were:
+\begin{itemize}[leftmargin=2em]
+    \item LOCF: 12 patients,
+    \item RecentLogSlope: 7 patients,
+    \item Simeoni: 1 patient.
+\end{itemize}
+
+\subsection{Interpretation}
+
+Notebook 02 changes the direction of the whole project. The lesson is not just that mechanistic models are imperfect. The lesson is that on sparse real clinical tumor trajectories, a simple persistence forecast is extremely hard to beat:
+\[
+\boxed{
+\text{if a mechanistic model cannot beat LOCF in rolling-origin prediction, retrospective fit alone is not enough evidence}
+}
+\]
+
+This is why Notebook 03 pivots to probabilistic forecasting and uncertainty calibration. Once point forecasting is difficult, the next scientifically meaningful question becomes: can we at least produce calibrated predictive intervals?
+
+% -----------------------------------------------------------------------------
+\section{Notebook 03: Probabilistic Forecasting and Calibration}
+% -----------------------------------------------------------------------------
+
+Notebook 03 makes a conceptual move rather than only a numerical one. It treats deterministic one-step predictions as mean structures and adds a residual uncertainty model on top.
+
+\subsection{From Point Forecasts to Predictive Distributions}
+
+Suppose a deterministic forecaster returns $\widehat r_{j+1}$. Notebook 03 models the next observation in log space as
+\[
+    \log r_{j+1}
+    =
+    \log \widehat r_{j+1}
+    +
+    \epsilon_{j+1}.
+\]
+Residuals from rolling-origin backtesting are then used to estimate the distribution of $\epsilon$.
+
+Two main strategies are used.
+
+\paragraph{Gaussian calibration.}
+Assume
+\[
+    \epsilon\sim\Normal(\mu,\sigma^2),
+\]
+usually with $\mu$ close to zero after calibration. Then a predictive interval for level $1-\alpha$ is
+\[
+    \log \widehat r_{j+1}\pm z_{1-\alpha/2}\sigma.
+\]
+The Gaussian negative log likelihood is
+\[
+    \mathrm{NLL}
+    =
+    \frac{1}{2}\log(2\pi\sigma^2)
+    +
+    \frac{(\epsilon-\mu)^2}{2\sigma^2}.
+\]
+
+\paragraph{Empirical-quantile calibration.}
+Instead of imposing Gaussian tails, estimate residual quantiles directly. If $q_{\alpha/2}$ and $q_{1-\alpha/2}$ are empirical residual quantiles, the predictive interval becomes
+\[
+    \bigl[
+        \log \widehat r_{j+1}+q_{\alpha/2},
+        \log \widehat r_{j+1}+q_{1-\alpha/2}
+    \bigr].
+\]
+This is especially attractive when residuals are skewed or heavy tailed.
+
+\subsection{Coverage, Width, and PIT Diagnostics}
+
+Notebook 03 formalizes several metrics that remain central later:
+\begin{itemize}[leftmargin=2em]
+    \item coverage at nominal levels such as $50\%$, $80\%$, $90\%$, and $95\%$;
+    \item interval width, which controls sharpness;
+    \item Gaussian NLL, which rewards both accuracy and calibrated uncertainty;
+    \item probability integral transform (PIT) diagnostics for calibration shape.
+\end{itemize}
+
+If $F_j$ is the predictive CDF for observation $y_j$, then
+\[
+    \PIT_j = F_j(y_j)
+\]
+should be approximately uniform on $[0,1]$ under perfect calibration.
+
+\subsection{Why Notebook 03 Matters}
+
+Notebook 03 is theoretically important because it shifts the goal from
+\[
+    \text{best deterministic forecast}
+\]
+to
+\[
+    \text{best calibrated predictive distribution}.
+\]
+That shift becomes even more important once later notebooks show that raw mechanistic parameters are weakly identifiable. Even when parameters are poorly recovered, useful predictive uncertainty may still be achievable.
+
+Notebook 04 operationalizes these ideas at full cohort scale and under leakage-free evaluation.
+
+% -----------------------------------------------------------------------------
+\section{Notebook 04: Cohort-Scale Leakage-Free Baselines and SBI Readiness}
+% -----------------------------------------------------------------------------
+
+Notebook 04 scales the rolling-origin and calibration framework from a 20-patient exploratory cohort to the canonical cross-study dataset.
+
+\subsection{Cohort Definition}
+
+The forecasting cohort applies stricter filters:
+\[
+    \text{at least 6 scans},\qquad
+    \text{duration at least 90 days},\qquad
+    \text{minimum training scans }=4.
+\]
+This produced:
+\begin{itemize}[leftmargin=2em]
+    \item 5,862 patients in the overall feature table,
+    \item 1,923 patients in the forecasting cohort,
+    \item 7,710 deterministic one-step predictions,
+    \item 23,130 long-format prediction rows across multiple models and calibration views.
+\end{itemize}
+
+\subsection{Leakage-Free Calibration Pools}
+
+Residual pools are formed without using the target patient's own future prediction error. Notebook 04 tests several calibration scopes:
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{global\_lopo}: global leave-one-patient-out,
+    \item \texttt{gapbin\_global\_lopo}: global but stratified by scan-gap bin,
+    \item \texttt{study\_lopo}: leave-one-patient-out within study,
+    \item \texttt{drug\_lopo}: leave-one-patient-out within drug signature,
+    \item \texttt{study\_drug\_lopo}: leave-one-patient-out within study-drug grouping.
+\end{itemize}
+
+The goal is not only calibration accuracy but also realism: uncertainty should adapt to the context in which the forecast is made.
+
+\subsection{Deterministic Baselines at Scale}
+
+The cohort-scale deterministic results are shown in Table~\ref{tab:n04-det}.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Notebook 04 deterministic empirical baselines over the cohort-scale rolling-origin task.}
+\label{tab:n04-det}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Predictions & Patients & Median $|\log$ err$|$ & RMSE \\
+\midrule
+LOCF & 7,710 & 1,923 & 0.068 & 0.302 \\
+RecentLogSlope & 7,710 & 1,923 & 0.105 & 0.359 \\
+LogLinear & 7,710 & 1,923 & 0.224 & 0.438 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+LOCF remains the best deterministic model. This is an important continuity check with Notebook 02: the dominance of persistence was not a small-cohort fluke.
+
+\subsection{Probabilistic Calibration Outputs}
+
+Notebook 04 identifies two especially relevant calibrated baselines.
+
+\paragraph{Best Gaussian calibration.}
+The best Gaussian calibration uses LOCF with \texttt{gapbin\_global\_lopo}. Its key values are:
+\[
+\begin{aligned}
+    \text{RMSE} &= 0.3015,\\
+    \text{mean Gaussian NLL} &= 0.2032,\\
+    \text{coverage}_{80} &= 0.9043,\\
+    \text{coverage}_{90} &= 0.9333,\\
+    \text{coverage}_{95} &= 0.9514.
+\end{aligned}
+\]
+The 95\% interval is almost perfectly calibrated, while lower nominal intervals are conservative.
+
+\paragraph{Best empirical-quantile calibration.}
+The most accurate nominal coverage comes from RecentLogSlope with \texttt{global\_lopo} empirical quantiles:
+\[
+\begin{aligned}
+    \text{coverage}_{50} &= 0.4997,\\
+    \text{coverage}_{80} &= 0.7997,\\
+    \text{coverage}_{90} &= 0.8999,\\
+    \text{coverage}_{95} &= 0.9499,
+\end{aligned}
+\]
+with mean absolute coverage error essentially zero. This calibration is extremely well matched to nominal probabilities, though the underlying deterministic forecaster is weaker than LOCF.
+
+Table~\ref{tab:n04-calib} summarizes the two main baselines.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Notebook 04 strongest leakage-free calibrated baselines.}
+\label{tab:n04-calib}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Model & Scope & Interval & Cov.50 & Cov.80 & Cov.90 & Cov.95 & Width80 & Mean cov. err \\
+\midrule
+LOCF & gapbin\_global\_lopo & Gaussian & 0.781 & 0.904 & 0.933 & 0.951 & 0.654 & 0.105 \\
+RecentLogSlope & global\_lopo & Emp.\ quantile & 0.500 & 0.800 & 0.900 & 0.950 & 0.520 & 0.00018 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{SBI Readiness by Study/Drug/Arm Stratum}
+
+Notebook 04 does more than score forecasting baselines. It introduces a concrete SBI-readiness layer. The rationale is:
+\[
+\text{Do not train SBI across all trials indiscriminately.}
+\]
+Instead, select coherent study/drug/arm strata with adequate scan depth, dose availability, manageable baseline error, and interpretable mechanism hints.
+
+The readiness counts were:
+\begin{itemize}[leftmargin=2em]
+    \item green: 8 strata,
+    \item yellow: 8 strata,
+    \item red: 17 strata.
+\end{itemize}
+
+The top recommended starter strata are shown in Table~\ref{tab:n04-readiness}.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Top SBI starter strata from Notebook 04.}
+\label{tab:n04-readiness}
+\begin{tabular}{p{0.18\textwidth}p{0.18\textwidth}p{0.16\textwidth}rrrr}
+\toprule
+Study & Arm & Family hint & Patients & Median scans & Baseline RMSE & Cov.90 \\
+\midrule
+CEDIRANIB\_HORIZONIII & FOLFOX + bevacizumab 5mg/kg & anti-angiogenic & 268 & 6 & 0.297 & 0.931 \\
+DATASET\_264 & FOLFOX alone & cytotoxic TGI & 190 & 7 & 0.361 & 0.891 \\
+EFC10262 & Placebo + FOLFIRI & cytotoxic TGI & 190 & 8 & 0.358 & 0.932 \\
+DATASET\_264 & Panitumumab + FOLFOX & cytotoxic TGI & 188 & 8 & 0.374 & 0.867 \\
+DATASET\_263 & Panitumumab + FOLFIRI & cytotoxic TGI & 152 & 7 & 0.306 & 0.915 \\
+A6181122 & UNKNOWN\_ARM & cytotoxic TGI & 127 & 8 & 0.331 & 0.911 \\
+EFC5505 & PLACEBO & cytotoxic TGI & 120 & 7 & 0.498 & 0.877 \\
+DATASET\_263 & FOLFIRI alone & cytotoxic TGI & 104 & 7 & 0.335 & 0.907 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why Notebook 04 Is a Turning Point}
+
+Notebook 04 formalizes three project-level rules:
+\begin{enumerate}[leftmargin=2em]
+    \item the official predictive baseline is leakage-free calibrated empirical forecasting, not retrospective ODE fit;
+    \item SBI should begin in coherent green/yellow strata, not across the entire pooled dataset;
+    \item SBI should be evaluated by posterior predictive calibration, NLL, interval width, and long-horizon behavior.
+\end{enumerate}
+
+The top green stratum was
+\[
+    \texttt{CEDIRANIB\_HORIZONIII / FOLFOX + bevacizumab 5 mg/kg},
+\]
+which becomes the anchor of Notebook 05.
+
+% -----------------------------------------------------------------------------
+\section{Literature and Model Catalogue}
+% -----------------------------------------------------------------------------
+
+The literature/model catalogue runs in parallel with the forecasting notebooks. Its role is to stop the project from adding compartments blindly just because a richer model helped one patient.
+
+\subsection{Mechanism-to-Model Routing}
+
+The catalogue maps drug classes and observed trajectory patterns to model families:
+\begin{itemize}[leftmargin=2em]
+    \item cytotoxic chemotherapy $\rightarrow$ Simeoni TGI or nested resistant-Simeoni,
+    \item targeted therapy $\rightarrow$ Emax or resistance-aware TGI,
+    \item anti-angiogenic therapy $\rightarrow$ carrying-capacity / vascular-support models,
+    \item immune checkpoint therapy $\rightarrow$ delayed immune-response models,
+    \item combination therapy $\rightarrow$ multi-input interaction TGI,
+    \item lesion-rich data $\rightarrow$ lesion-level hierarchical models.
+\end{itemize}
+
+\subsection{Why Anti-Angiogenic Therapy Needs a Different Latent Story}
+
+The catalogue explicitly warns against representing anti-VEGF-like treatment as direct cytotoxic kill alone. A reduced carrying-capacity model uses tumor burden $V(t)$ and vascular support $K(t)$:
+\[
+\begin{aligned}
+    \frac{dV}{dt}&=\rho V\left(1-\frac{V}{K}\right),\\
+    \frac{dK}{dt}&=k_{K,\mathrm{recovery}}(K_0-K)-k_{\mathrm{anti}}C(t)K.
+\end{aligned}
+\]
+This is the conceptual starting point for the anti-angiogenic simulator later used in Notebooks 05C and 06.
+
+\subsection{Strategic Use of the Catalogue}
+
+The catalogue changes model development from
+\[
+    \text{``what extra compartment should we add next?''}
+\]
+to
+\[
+    \text{``what latent structure is justified by drug mechanism, data granularity, and identifiability?''}
+\]
+That is why Notebook 05 does not simply export the original all-purpose Simeoni model. It exports simulator families aligned with specific strata.
+
+% -----------------------------------------------------------------------------
+\section{Notebook 05: Selected-Stratum Simulator Design and Synthetic SBI Preparation}
+% -----------------------------------------------------------------------------
+
+Notebook 05 is where the project transitions from real-data forecasting diagnostics to synthetic SBI design.
+
+\subsection{Selected Target Stratum}
+
+The chosen first stratum is
+\[
+    \texttt{CEDIRANIB\_HORIZONIII / FOLFOX + bevacizumab 5 mg/kg}.
+\]
+Its readiness summary from Notebook 04 is:
+\begin{itemize}[leftmargin=2em]
+    \item 268 real patients,
+    \item median 6 scans,
+    \item median duration 362 days,
+    \item median gap 64 days,
+    \item full dose availability,
+    \item baseline RMSE 0.297,
+    \item baseline 90\% coverage 0.931.
+\end{itemize}
+
+The response-class fractions in the real cohort are:
+\[
+\begin{aligned}
+    \text{response or shrinkage} &= 0.459,\\
+    \text{response then regrowth} &= 0.325,\\
+    \text{stable-like} &= 0.198,\\
+    \text{progression or growth} &= 0.019.
+\end{aligned}
+\]
+
+\subsection{Synthetic Simulator Philosophy}
+
+Notebook 05 does not simulate artificial evenly spaced trajectories from generic priors alone. It reuses real patient templates:
+\begin{itemize}[leftmargin=2em]
+    \item real scan schedules,
+    \item real dose schedules,
+    \item real trajectory lengths,
+    \item real baseline scales,
+    \item clinically coherent study/drug/arm metadata.
+\end{itemize}
+
+This is crucial. For SBI, the observation design itself is part of the inverse problem.
+
+\subsection{Simulator Families}
+
+The first 05 export used two simulator families.
+
+\paragraph{Simeoni family.}
+This retains the cytotoxic transit-damage model and serves as a mechanistic baseline family.
+
+\paragraph{Angio family.}
+For anti-angiogenic behavior, a reduced tumor-plus-carrying-capacity model is used:
+\[
+\begin{aligned}
+    \frac{dV}{dt}
+    &=\rho V\left(1-\frac{V}{K}\right),\\
+    \frac{dK}{dt}
+    &=k_{K,\mathrm{recovery}}(K_0-K)-k_{\mathrm{anti}}C(t)K.
+\end{aligned}
+\]
+The initial capacity is parameterized as
+\[
+    K(0)=K_0=\text{K0\_ratio}\cdot V(0),
+\]
+and the core angio parameter vector becomes
+\[
+    \theta_{\mathrm{angio}}
+    =
+    (\rho,k_{\mathrm{anti}},k_{K,\mathrm{recovery}},K0\_ratio,v_0).
+\]
+
+This reduced model is intentionally low-dimensional. It is designed to test whether anti-angiogenic local dynamics can be inferred at all from sparse relative \sld{} trajectories.
+
+\subsection{Initial 05 Export}
+
+The first synthetic export contained:
+\begin{itemize}[leftmargin=2em]
+    \item 2,000 total simulations,
+    \item 1,000 Simeoni simulations,
+    \item 1,000 angio simulations,
+    \item array shape $\xobs\in\R^{2000\times 14\times 3}$,
+    \item parameter array shape $\theta\in\R^{2000\times 10}$ in the mixed-family export.
+\end{itemize}
+
+The mixed theta names were
+\[
+(\theta_{K0\_ratio},\theta_{k_K\_recovery},\theta_{k\_anti},\theta_{k\_cyt},\theta_{k\_tr},\theta_{\lambda0},\theta_{\lambda1},\theta_{\psi_g},\theta_{\rho},\theta_{v0}),
+\]
+with a simulator ID indicating whether the sample came from the Simeoni or angio family.
+
+\subsection{Why 05 Needed Further Tuning}
+
+The first prior-predictive cohort did not match the real stratum closely enough. In the target CEDIRANIB stratum, the synthetic response-class fractions were too progression-heavy:
+\begin{itemize}[leftmargin=2em]
+    \item angio progression/growth: $0.422$,
+    \item Simeoni progression/growth: $0.557$,
+    \item real progression/growth: only $0.0187$.
+\end{itemize}
+
+That mismatch is not a cosmetic issue. If the synthetic generator produces the wrong local dynamics, an NPE trained on it will learn the wrong inverse mapping.
+
+% -----------------------------------------------------------------------------
+\section{Notebook 05B and 05C: Tuned Multistratum Synthetic Exports}
+% -----------------------------------------------------------------------------
+
+The 05B and 05C updates are where the simulator preparation becomes mature enough for Notebook 06.
+
+\subsection{05B: Prior Tuning and Multistratum Export}
+
+Notebook 05B expands from one target stratum to four selected strata and tunes class quotas so the synthetic response-pattern mixture better resembles the real data.
+
+The four strata are:
+\begin{enumerate}[leftmargin=2em]
+    \item CEDIRANIB\_HORIZONIII / FOLFOX + bevacizumab 5 mg/kg,
+    \item DATASET\_264 / FOLFOX alone,
+    \item EFC10262 / Placebo + FOLFIRI,
+    \item DATASET\_264 / Panitumumab + FOLFOX.
+\end{enumerate}
+
+The tuned export contains
+\[
+    4{,}800
+\]
+synthetic trajectories total:
+\[
+    2{,}400\ \text{Simeoni}
+    \qquad\text{and}\qquad
+    2{,}400\ \text{angio}.
+\]
+Each study-arm-stratum contributes 600 simulations per simulator family.
+
+The grouped split is by real template rather than by individual simulation row, which is essential to prevent template leakage between train and test.
+
+\subsection{05C: Local-Dynamics Matching}
+
+Notebook 05C refines the export again, this time emphasizing local one-step dynamics and real-vs-synthetic residual matching. The final 05C exports are:
+\[
+    \xobs\in\R^{2400\times 25\times 3},
+\]
+\[
+    x_{\mathrm{cov}}\in\R^{2400\times 8},
+\]
+with covariates
+\[
+    (\log \text{baseline \sld},\ \text{duration\_years},\ n\_scans/25,\ \text{dose\_confounded},\ \text{4 stratum one-hots}).
+\]
+
+The train/validation/test split sizes for the angio export are:
+\[
+    1948,\quad 218,\quad 234.
+\]
+
+\subsection{05C Real-vs-Synthetic Output Matching}
+
+The response summaries in Table~\ref{tab:05c-response} show how much closer the tuned synthetic cohorts came to the real strata.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Selected 05C real-vs-synthetic response summaries.}
+\label{tab:05c-response}
+\begin{tabular}{p{0.21\textwidth}p{0.10\textwidth}rrrr}
+\toprule
+Source / stratum & Simulator & Median final rel.\ \sld{} & Median minimum rel.\ \sld{} & Shrink frac & Regrowth frac \\
+\midrule
+CEDIRANIB real & real & 0.629 & 0.521 & 0.459 & 0.325 \\
+CEDIRANIB 05C & angio & 0.459 & 0.392 & 0.453 & 0.322 \\
+CEDIRANIB 05C & simeoni & 0.311 & 0.256 & 0.453 & 0.322 \\
+FOLFOX-alone real & real & 0.619 & 0.404 & 0.389 & 0.458 \\
+FOLFOX-alone 05C & angio & 0.525 & 0.381 & 0.390 & 0.458 \\
+FOLFOX-alone 05C & simeoni & 0.286 & 0.212 & 0.390 & 0.458 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The local residual behavior is even more informative. For the target CEDIRANIB stratum:
+\[
+\text{real LOCF RMSE}=0.231,
+\qquad
+\text{angio synthetic LOCF RMSE}=0.176,
+\qquad
+\text{simeoni synthetic LOCF RMSE}=0.486.
+\]
+Thus the angio simulator is much closer than the Simeoni family to the local dynamics of the anti-angiogenic real cohort.
+
+Table~\ref{tab:05c-residual} summarizes the key values.
+
+\begin{table}[H]
+\centering
+\small
+\caption{05C local-dynamics matching via LOCF residual summaries.}
+\label{tab:05c-residual}
+\begin{tabular}{p{0.21\textwidth}p{0.10\textwidth}rrrr}
+\toprule
+Source / stratum & Simulator & Count & Median $|\log$ err$|$ & RMSE & $q_{95}$ \\
+\midrule
+CEDIRANIB real & real & 772 & 0.064 & 0.231 & 0.363 \\
+CEDIRANIB synthetic & angio & 1,670 & 0.112 & 0.176 & 0.333 \\
+CEDIRANIB synthetic & simeoni & 1,661 & 0.250 & 0.486 & 0.555 \\
+EFC10262 real & real & 850 & 0.043 & 0.384 & 0.338 \\
+EFC10262 synthetic & angio & 2,306 & 0.077 & 0.144 & 0.262 \\
+EFC10262 synthetic & simeoni & 2,162 & 0.131 & 0.307 & 0.349 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why 05C Becomes the Official Notebook 06 Input}
+
+Notebook 05C is the correct launch point for NPE because it satisfies three conditions:
+\begin{enumerate}[leftmargin=2em]
+    \item grouped template splits avoid train/test leakage,
+    \item local dynamics are substantially closer to real data than the naive export,
+    \item the angio simulator matches the anti-angiogenic target stratum far better than the plain Simeoni family.
+\end{enumerate}
+
+That is why Notebook 06 uses the 05C angio-only export rather than the earlier mixed-family array.
+
+% -----------------------------------------------------------------------------
+\section{Notebook 06: First Neural Posterior Estimation on 05C Angio}
+% -----------------------------------------------------------------------------
+
+Notebook 06 asks the first truly SBI-specific question:
+\[
+    \text{Can a learned posterior recover simulator parameters from synthetic tumor trajectories?}
+\]
+
+\subsection{Input Representation}
+
+For each simulation, the padded observation sequence is
+\[
+    \xobs
+    =
+    [\tilde t,\log r,m]
+    \in\R^{T_{\max}\times 3},
+\]
+where $\tilde t$ is normalized time, $\log r$ is log-relative tumor burden, and $m$ is a mask for variable-length trajectories.
+
+The covariates are
+\[
+    x_{\mathrm{cov}}\in\R^8,
+\]
+with baseline scale, duration, scan count, dose-confounding flag, and one-hot stratum indicators.
+
+The 05C angio target parameters are
+\[
+    \theta=(\rho,k_{\mathrm{anti}},k_{K,\mathrm{recovery}},K0\_ratio,v_0).
+\]
+Notebook 06 standardizes them on log scale:
+\[
+    z=\frac{\log\theta-\mu_{\log\theta}}{\sigma_{\log\theta}}.
+\]
+
+\subsection{Posterior Families and Baselines}
+
+Notebook 06 compares:
+\begin{itemize}[leftmargin=2em]
+    \item a prior Gaussian baseline,
+    \item Ridge residual bootstrap,
+    \item Random Forest residual bootstrap,
+    \item summary-feature MLP regression,
+    \item summary-feature MDNs,
+    \item GRU-based MDNs.
+\end{itemize}
+
+The core posterior density family is a mixture density network:
+\[
+    q_\phi(z\given x)
+    =
+    \sum_{k=1}^{K}\pi_k(x)\Normal\!\bigl(z;\mu_k(x),\diag(\sigma_k^2(x))\bigr).
+\]
+The GRU variant uses the sequential trajectory directly; the summary models compress the trajectory into engineered features first.
+
+\subsection{Train/Validation/Test Split}
+
+The 05C angio export used here contains:
+\begin{itemize}[leftmargin=2em]
+    \item $N=2400$ total simulations,
+    \item $T_{\max}=25$,
+    \item train/val/test sizes $1948/218/234$,
+    \item 757 unique real templates,
+    \item four strata.
+\end{itemize}
+
+Because the split is template-grouped, the task is harder and more realistic than a random row split.
+
+\subsection{Notebook 06 Aggregate Results}
+
+The selected best model is
+\[
+    \texttt{gru\_mdn\_K5\_H128}.
+\]
+Its aggregate held-out metrics are
+\[
+\begin{aligned}
+    \text{mean RMSE}_z &= 0.858,\\
+    \text{mean MAE}_z &= 0.727,\\
+    \text{mean RMSE}_{\log\theta} &= 0.883,\\
+    \text{mean abs.\ relative error} &= 0.981,\\
+    \text{mean corr}_z &= 0.454,\\
+    \text{mean coverage}_{90} &= 0.915,\\
+    \text{mean posterior std}_z &= 0.866.
+\end{aligned}
+\]
+
+This is better than the prior and slightly better than the Ridge / Random Forest baselines, but the margin is not large.
+
+Parameter-level performance is shown in Table~\ref{tab:n06-param}.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Notebook 06 best-model parameter recovery on held-out 05C angio simulations.}
+\label{tab:n06-param}
+\begin{tabular}{lrrrrr}
+\toprule
+Parameter & RMSE$_z$ & Corr$_z$ & Mean rel.\ err & Cov.90 & Posterior std$_z$ \\
+\midrule
+$\rho$ & 0.905 & 0.450 & 0.928 & 0.906 & 0.913 \\
+$k_{\mathrm{anti}}$ & 0.928 & 0.384 & 1.506 & 0.906 & 0.901 \\
+$k_{K,\mathrm{recovery}}$ & 0.908 & 0.377 & 1.315 & 0.944 & 0.939 \\
+$K0\_ratio$ & 0.952 & 0.265 & 0.386 & 0.915 & 0.950 \\
+$v_0$ & 0.598 & 0.792 & 0.770 & 0.902 & 0.625 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Interpretation of Notebook 06}
+
+Only $v_0$ is recovered moderately well, with correlation near
+\[
+    0.79.
+\]
+This is not surprising because baseline tumor scale is directly represented in the covariates. The harder mechanistic parameters
+\[
+    \rho,\quad k_{\mathrm{anti}},\quad k_{K,\mathrm{recovery}},\quad K0\_ratio
+\]
+are recovered only weakly. Correlations are low to moderate and errors remain substantial.
+
+This result is extremely important:
+\[
+\boxed{
+\text{even under simulator-matched synthetic data, the angio parameters are only weakly recoverable}
+}
+\]
+Therefore the main problem is not just neural architecture quality. It is the information content of sparse relative \sld{} trajectories.
+
+% -----------------------------------------------------------------------------
+\section{Notebook 06B: Stabilized NPE and Identifiability Rescue Attempts}
+% -----------------------------------------------------------------------------
+
+Notebook 06B is explicitly a diagnosis notebook. It asks whether poor performance is due to:
+\begin{enumerate}[leftmargin=2em]
+    \item random-vs-grouped split shift,
+    \item unstable MDN training,
+    \item excessive target dimensionality,
+    \item bad parameterization of the latent dynamics,
+    \item or fundamental weak identifiability.
+\end{enumerate}
+
+\subsection{Stabilization Strategy}
+
+The patch replaces unstable MDN heads with simpler Gaussian posterior heads and tests reduced/composite targets. Instead of always predicting the full five raw angio parameters, Notebook 06B defines:
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{core2\_growth\_treatment}: $(\log\rho,\log k_{\mathrm{anti}})$,
+    \item \texttt{core3\_logtheta}: $(\log\rho,\log k_{\mathrm{anti}},\log K0\_ratio)$,
+    \item \texttt{composite3}: growth, treatment-vs-growth, recovery-vs-treatment, and capacity coordinates.
+\end{itemize}
+
+The composite representation is meant to test whether the data identify \emph{relative dynamical balances} better than raw rate constants.
+
+\subsection{Decision Rule}
+
+The patch compares each stabilized model to a prior baseline on the same target. If the relative RMSE improvement over the prior is small, the model is still weakly informative.
+
+In general form, define
+\[
+    G
+    =
+    \frac{\mathrm{RMSE}_{\mathrm{prior}}-\mathrm{RMSE}_{\mathrm{model}}}
+    {\mathrm{RMSE}_{\mathrm{prior}}}.
+\]
+Notebook 06B interprets
+\[
+    5\%\text{--}15\%
+\]
+relative gain as a weak-identifiability regime rather than a strong inference success.
+
+\subsection{Notebook 06B Outputs}
+
+The strongest reduced/composite targets are summarized in Table~\ref{tab:n06b}.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Notebook 06B stabilized Gaussian target-comparison summary.}
+\label{tab:n06b}
+\begin{tabular}{p{0.21\textwidth}rrrccc}
+\toprule
+Target & Dim & Best model & RMSE$_z$ & Prior RMSE$_z$ & Rel.\ gain & Cov.90 \\
+\midrule
+composite3 & 4 & GRU Gaussian & 0.900 & 1.006 & 10.5\% & 0.868 \\
+core2\_growth\_treatment & 2 & Summary Gaussian & 0.907 & 1.007 & 9.95\% & 0.853 \\
+core3\_logtheta & 3 & GRU Gaussian & 0.924 & 1.001 & 7.72\% & 0.886 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The best configuration is
+\[
+    \texttt{06B\_gru\_gaussian\_composite\_global\_sigma},
+\]
+with
+\[
+    \text{mean RMSE}_z=0.900,
+    \qquad
+    \text{relative improvement over prior}=10.5\%.
+\]
+
+However, that still falls into the weak-identifiability band defined by the notebook.
+
+\subsection{Interpretation of Notebook 06B}
+
+Notebook 06B is one of the most important notebooks in the whole sequence because it prevents the wrong conclusion. A naive reading of Notebook 06 might say:
+\[
+    \text{``try a larger network''}.
+\]
+Notebook 06B shows why that is the wrong move. Reduced targets, composite targets, and stabilized Gaussian heads only produce modest improvements over the prior:
+\[
+    7.7\%\text{ to }10.5\%.
+\]
+That is a scientific signal, not a training inconvenience. It means:
+\[
+\boxed{
+\text{sparse relative \sld{} trajectories weakly identify composite growth/treatment balances, but not detailed raw angio parameters}
+}
+\]
+
+The right next step is therefore posterior predictive validation, not parameter-regression escalation.
+
+% -----------------------------------------------------------------------------
+\section{Integrated Scientific Interpretation}
+% -----------------------------------------------------------------------------
+
+Across Notebooks 00--06B, the project asks increasingly difficult questions.
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Can the raw clinical files be made analysis-ready?}
+    Yes. Ten studies were canonicalized, with 5,862 patients entering the feature table.
+
+    \item \textbf{Can mechanistic models fit retrospective trajectories?}
+    Yes. On a selected 20-patient batch, median retrospective RMSE improved from $0.290$ under plain Simeoni to $0.151$ after conservative selection over nested resistance and observation shifts.
+
+    \item \textbf{Do those fits generalize to future scans?}
+    Only weakly. Hold-out median test RMSEs remained around $0.49$--$0.51$.
+
+    \item \textbf{Do mechanistic models beat simple forecasting baselines?}
+    No. LOCF dominated rolling-origin point forecasting on both the 20-patient and 1,923-patient cohorts.
+
+    \item \textbf{Can useful predictive uncertainty be calibrated empirically?}
+    Yes. Leakage-free Gaussian and empirical-quantile calibration produced strong coverage baselines.
+
+    \item \textbf{Can a clinically coherent SBI starter problem be isolated?}
+    Yes. The CEDIRANIB anti-angiogenic stratum was selected as the first green starter stratum.
+
+    \item \textbf{Can synthetic training data be made structurally similar to the real local dynamics?}
+    Partly yes. The 05C angio export is much closer than the naive or Simeoni-only synthetic alternatives.
+
+    \item \textbf{Can NPE recover raw simulator parameters on simulator-matched synthetic data?}
+    Only weakly. The best GRU-MDN barely outperformed simpler baselines, and 06B showed only modest gains over the prior even for reduced targets.
+\end{enumerate}
+
+The full project therefore delivers a valuable negative result:
+\[
+\boxed{
+\text{the real difficulty is not just flexible modeling; it is weak identifiability from sparse tumor trajectories}
+}
+\]
+
+That negative result is productive. It stops the project from over-interpreting neural posterior outputs and redirects it toward better scientific evaluation criteria.
+
+% -----------------------------------------------------------------------------
+\section{What the Next Full Notebook Should Be}
+% -----------------------------------------------------------------------------
+
+The next notebook should not be another architecture search. It should be a posterior predictive notebook:
+\[
+    \texttt{07\_angio\_posterior\_predictive\_checks\_synthetic\_then\_real.ipynb}.
+\]
+
+\subsection{Goal}
+
+The target question is
+\[
+    \text{Can posterior samples generate calibrated predictive bands over tumor trajectories?}
+\]
+not
+\[
+    \text{Can we recover every mechanistic parameter precisely?}
+\]
+
+\subsection{Posterior Predictive Workflow}
+
+For a fitted posterior $q_\phi(\theta\given x)$, the posterior predictive procedure is
+\[
+    \theta^{(s)}\sim q_\phi(\theta\given x),
+\]
+\[
+    \widetilde y^{(s)}_{1:T}\sim p(y_{1:T}\given \theta^{(s)},u),
+\]
+followed by comparisons between the empirical trajectory and the posterior predictive ensemble.
+
+\subsection{Pass/Fail Metrics}
+
+The next notebook should report:
+\begin{itemize}[leftmargin=2em]
+    \item predictive coverage at $80\%$, $90\%$, and $95\%$,
+    \item interval width versus the empirical baselines from Notebook 04,
+    \item posterior predictive NLL,
+    \item calibration by stratum and scan-gap bin,
+    \item robustness to sparse prefixes and local jumps,
+    \item synthetic-first validation before any real-patient interpretation.
+\end{itemize}
+
+The standard for success is not ``posterior samples look diverse.'' The standard is:
+\[
+\text{posterior predictive performance at least matches calibrated empirical baselines}
+\]
+and ideally improves on them in clinically coherent strata.
+
+% -----------------------------------------------------------------------------
+\section{Limitations}
+% -----------------------------------------------------------------------------
+
+The current pipeline remains a deliberately simplified but rigorous pre-SBI program. Main limitations are:
+\begin{itemize}[leftmargin=2em]
+    \item the exposure model is still an exponential forcing approximation, not full PK;
+    \item \sld{} compresses lesion-level heterogeneity into a single scalar;
+    \item observation shifts are phenomenological and may reflect multiple non-biological processes;
+    \item synthetic angio dynamics are reduced effective dynamics, not a full vascular biology model;
+    \item parameter inference is tested mainly on synthetic data and remains weak even there;
+    \item the strongest real-data predictive baselines remain empirical rather than mechanistic.
+\end{itemize}
+
+These are not failures. They define the correct next stage of work.
+
+% -----------------------------------------------------------------------------
+\section{Conclusion}
+% -----------------------------------------------------------------------------
+
+The draft \texttt{notebook1\_all\_notebooks\_updated.tex} has now been expanded into a full report that treats each notebook as a real modeling stage rather than a short summary bullet. The complete notebook sequence tells a coherent story:
+
+\begin{enumerate}[leftmargin=2em]
+    \item clinical data can be canonicalized across heterogeneous oncology trials;
+    \item mechanistic TGI models can fit many retrospective trajectories well;
+    \item those fits do not guarantee good future prediction;
+    \item strong empirical rolling-origin baselines are hard to beat;
+    \item calibrated predictive uncertainty is feasible and should be the benchmark;
+    \item simulator choice must follow drug mechanism and data context;
+    \item synthetic SBI is feasible in carefully selected strata;
+    \item raw parameter recovery remains weak even under simulator-matched synthetic data.
+\end{enumerate}
+
+The most important conclusion is therefore:
+\[
+\boxed{
+\begin{minipage}{0.86\textwidth}
+Sparse relative \sld{} trajectories are informative enough to support useful empirical forecasting and some coarse dynamical uncertainty quantification, but they do not strongly identify detailed mechanistic PK/PD parameters. The next scientifically meaningful milestone is posterior predictive calibration, not aggressive raw-parameter recovery.
+\end{minipage}
+}
+\]
+
+That is a strong methodological result. It protects future SBI work from over-claiming and defines a realistic path toward a credible oncology posterior simulator.
+
+\appendix
+
+% -----------------------------------------------------------------------------
+\section{Notebook-to-Output Map}
+% -----------------------------------------------------------------------------
+
+\begin{center}
+\small
+\begin{tabular}{p{0.16\textwidth}p{0.30\textwidth}p{0.36\textwidth}}
+\toprule
+Notebook & Main purpose & Most important saved output or conclusion \\
+\midrule
+00 & Clinical audit and first mechanistic discovery & Ten studies canonicalized; retrospective 20-patient median RMSE improved to $0.151$ after conservative model selection. \\
+01 & Hold-out validation & Future-scan median test RMSEs remained near $0.49$--$0.51$, exposing overfit risk. \\
+02 & Rolling-origin forecasting & LOCF dominated with RMSE $0.185$ on the 20-patient cohort. \\
+03 & Probabilistic calibration theory & Formalized Gaussian and empirical residual calibration, coverage, NLL, and PIT. \\
+04 & Cohort-scale leakage-free baselines & 1,923-patient cohort; LOCF best deterministic baseline; near-perfect empirical interval coverage available. \\
+05 & Selected-stratum simulator design & CEDIRANIB anti-angiogenic starter stratum selected; first synthetic SBI arrays exported. \\
+05B & Multistratum tuned export & Four-stratum, grouped-split synthetic export with 2,400 angio and 2,400 Simeoni simulations. \\
+05C & Local-dynamics matching & Angio simulator brought much closer to real local residual behavior than Simeoni in the target anti-angiogenic stratum. \\
+06 & First angio NPE & Best GRU-MDN achieved mean RMSE$_z=0.858$ but weak raw parameter recovery overall. \\
+06B & Identifiability rescue attempt & Reduced/composite targets improved only $7.7\%$--$10.5\%$ over the prior, implying weak identifiability. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -----------------------------------------------------------------------------
+\begin{thebibliography}{12}
+
+\bibitem{simeoni2004}
+M. Simeoni et al., ``Predictive pharmacokinetic-pharmacodynamic modeling of tumor growth kinetics in xenograft models after administrations of anticancer agents,'' \emph{Cancer Research}, 2004.
+
+\bibitem{magni2008}
+P. Magni et al., ``A minimal model of tumor growth inhibition,'' 2008.
+
+\bibitem{terranova2013}
+N. Terranova et al., ``A predictive pharmacokinetic-pharmacodynamic model of tumor growth kinetics in xenograft mice after administration of anticancer agents given in combination,'' 2013.
+
+\bibitem{claret2009}
+L. Claret et al., ``Model-based prediction of phase III overall survival in colorectal cancer on the basis of phase II tumor dynamics,'' \emph{Journal of Clinical Oncology}, 2009.
+
+\bibitem{krishnan2021}
+S. Krishnan et al., ``Tumor growth inhibition modeling of individual lesion dynamics and inter-organ variability in HER2-negative breast cancer patients treated with docetaxel,'' 2021.
+
+\bibitem{courlet2023}
+P. Courlet et al., ``Modeling tumor size dynamics based on real-world clinical and imaging data in advanced melanoma patients receiving immune checkpoint inhibitors,'' 2023.
+
+\bibitem{oden2013}
+J. T. Oden et al., ``Selection and assessment of phenomenological models of tumor growth,'' 2013.
+
+\bibitem{whitaker2019}
+G. A. Whitaker et al., ``Bayesian inference for stochastic differential equation mixed effects models of a tumour xenography study,'' 2019.
+
+\bibitem{ezhov2023}
+D. Ezhov et al., ``Learn-Morph-Infer: A new way of solving the inverse problem for brain tumor modeling,'' 2023.
+
+\bibitem{yankeelov2013}
+T. E. Yankeelov et al., ``Clinically Relevant Modeling of Tumor Growth and Treatment Response,'' \emph{Science Translational Medicine}, 2013.
+
+\bibitem{gholami2016}
+A. Gholami et al., ``An inverse problem formulation for parameter estimation of a reaction-diffusion model of low grade gliomas,'' \emph{Journal of Mathematical Biology}, 2016.
+
+\bibitem{le2018}
+A. L\^e et al., ``Subject-specific brain tumor growth modelling via an efficient Bayesian inference framework,'' in \emph{Medical Imaging 2018: Image Processing}, 2018.
+
+\end{thebibliography}
+
+\end{document}
