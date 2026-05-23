@@ -2,3 +2,9 @@
 *.sas7bdat
 
 oncology-sbi-pkpd/data/
+
+oncology-sbi-pkpd/outputs/
+
+outputs/
+
+*.sas7bdat
